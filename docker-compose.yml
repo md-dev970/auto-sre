@@ -1,0 +1,52 @@
+services:
+  kestra:
+    image: kestra/kestra:v0.18.0
+    container_name: kestra
+    user: root
+    command: server standalone
+    ports:
+      - "8080:8080"
+    environment:
+      # Disable authentication for local development
+      KESTRA_CONFIGURATION: |
+        kestra:
+          server:
+            basic-auth:
+              enabled: false
+          repository:
+            type: memory
+          queue:
+            type: memory
+          storage:
+            type: local
+            local:
+              base-path: /app/kestra-data
+          # Pass secrets from environment variables
+          secret:
+            type: env
+            env:
+              prefix: SECRET_
+      # Secrets - these will be available as secret('...') in flows
+      SECRET_GEMINI_API_KEY: ${GEMINI_API_KEY}
+      # SECRET_OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      SECRET_VERCEL_TOKEN: ${VERCEL_TOKEN}
+    env_file:
+      - .env
+    volumes:
+      # Kestra data storage
+      - ./kestra-data:/app/kestra-data
+      # Flow files - Kestra will auto-load these
+      - ./flows:/app/flows
+      # Docker socket for running Docker tasks
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - kestra-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  kestra-network:
+    driver: bridge

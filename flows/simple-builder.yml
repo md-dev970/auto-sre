@@ -1,0 +1,226 @@
+id: simple-builder
+namespace: production
+description: |
+  Build Next.js app with Cline CLI and deploy to Vercel.
+  
+  This flow:
+  1. Creates a new Next.js project
+  2. Uses Cline AI to generate code based on user prompt
+  3. Deploys to Vercel
+  4. Returns the preview URL and generated code
+
+labels:
+  env: production
+  team: platform
+  type: ai-builder
+
+inputs:
+  - id: prompt
+    type: STRING
+    description: User prompt describing the app to build (e.g., "Create a todo app with dark mode")
+    required: true
+
+  - id: project_prefix
+    type: STRING
+    description: Optional prefix for the project name
+    required: false
+    defaults: app
+
+variables:
+  project_name: "{{ inputs.project_prefix }}-{{ execution.id | lower | replace('[^a-z0-9-]', '-') | truncate(40, '') }}"
+
+tasks:
+  - id: log-start
+    type: io.kestra.plugin.core.log.Log
+    description: Log the start of the build process
+    message: |
+      Starting build for prompt: {{ inputs.prompt }}
+      Execution ID: {{ execution.id }}
+
+  - id: build-and-deploy
+    type: io.kestra.plugin.scripts.shell.Script
+    description: Build Next.js app with Cline AI and deploy to Vercel
+    warningOnStdErr: false
+    timeout: PT30M
+    interpreter:
+      - /bin/bash
+      - -c
+    retry:
+      type: constant
+      maxAttempt: 2
+      interval: PT1M
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      image: kestra-cline:latest
+      pullPolicy: NEVER
+    outputFiles:
+      - preview_url.txt
+      - build.log
+      - generated_code.txt
+    env:
+      USER_PROMPT: "{{ inputs.prompt }}"
+      GEMINI_API_KEY: "{{ secret('GEMINI_API_KEY') }}"
+      # OPENROUTER_API_KEY: "{{ secret('OPENROUTER_API_KEY') }}"
+      VERCEL_TOKEN: "{{ secret('VERCEL_TOKEN') }}"
+      PROJECT_NAME: "{{ inputs.project_prefix }}-{{ execution.id }}"
+      NODE_OPTIONS: "--max-old-space-size=8192"
+      HOME: "/root"
+    script: |
+      #!/bin/bash
+      set -e
+      
+      # Ensure HOME is set for Cline
+      export HOME="${HOME:-/root}"
+      mkdir -p "$HOME/.cline"
+      
+      # Initialize output files
+      echo "" > preview_url.txt
+      echo "" > generated_code.txt
+      
+      # Sanitize project name
+      PROJECT_NAME_SAFE=$(echo "$PROJECT_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-50)
+      
+      # Start logging
+      {
+        echo "=== Kestra + Cline Build Pipeline ==="
+        echo "Start time: $(date -Iseconds)"
+        echo "Execution ID: ${EXECUTION_ID:-unknown}"
+        echo "Prompt: $USER_PROMPT"
+        echo "Project: $PROJECT_NAME_SAFE"
+        echo "HOME: $HOME"
+        echo ""
+      } | tee build.log
+      
+      # Step 1: Authenticate with Gemini 2.5
+      echo "=== Step 1: Authenticating with Gemini ===" | tee -a build.log
+      if ! cline auth --provider gemini --apikey "$GEMINI_API_KEY" --modelid "gemini-2.5-flash" 2>&1 | tee -a build.log; then
+        echo "Warning: Auth command returned non-zero, continuing..." | tee -a build.log
+      fi
+      CLINE_VERSION=$(cline version 2>/dev/null || echo "unknown")
+      echo "Cline version: $CLINE_VERSION" | tee -a build.log
+      
+      # Step 2: Create Next.js project
+      echo "" | tee -a build.log
+      echo "=== Step 2: Creating Next.js project ===" | tee -a build.log
+      npx create-next-app@latest "$PROJECT_NAME_SAFE" \
+        --typescript --tailwind --eslint --app \
+        --use-npm --no-git --yes 2>&1 | tee -a build.log
+      
+      cd "$PROJECT_NAME_SAFE"
+      
+      # Step 3: Run Cline AI with retry
+      echo "" | tee -a ../build.log
+      echo "=== Step 3: Running Cline AI ===" | tee -a ../build.log
+      CLINE_PROMPT="You are in a Next.js 14 App Router project. TASK: COMPLETELY REPLACE app/page.tsx for: $USER_PROMPT. RULES: 1) Add 'use client' at top 2) Replace ALL default template code 3) Use Tailwind CSS 4) ONLY modify files - DO NOT run npm run dev or any commands 5) App deploys automatically to Vercel. Just edit files and finish."
+      
+      # Try Cline up to 3 times
+      for attempt in 1 2 3; do
+        echo "Cline attempt $attempt..." | tee -a ../build.log
+        if cline "$CLINE_PROMPT" -y --oneshot 2>&1 | tee -a ../build.log; then
+          echo "Cline completed successfully on attempt $attempt" | tee -a ../build.log
+          break
+        else
+          echo "Cline attempt $attempt failed, retrying..." | tee -a ../build.log
+          sleep 2
+        fi
+      done
+      
+      # Step 4: Capture generated code
+      echo "" | tee -a ../build.log
+      echo "=== Step 4: Capturing generated code ===" | tee -a ../build.log
+      {
+        echo "=== Generated Code ==="
+        echo "Project: $PROJECT_NAME_SAFE"
+        echo "Timestamp: $(date -Iseconds)"
+        echo ""
+        echo "--- app/page.tsx ---"
+      } > ../generated_code.txt
+      
+      if [ -f "app/page.tsx" ]; then
+        cat app/page.tsx >> ../generated_code.txt
+        echo "Captured app/page.tsx" | tee -a ../build.log
+      else
+        echo "// No page file found" >> ../generated_code.txt
+        echo "Warning: app/page.tsx not found" | tee -a ../build.log
+      fi
+      
+      # Capture layout if exists
+      if [ -f "app/layout.tsx" ]; then
+        echo "" >> ../generated_code.txt
+        echo "--- app/layout.tsx ---" >> ../generated_code.txt
+        cat app/layout.tsx >> ../generated_code.txt
+        echo "Captured app/layout.tsx" | tee -a ../build.log
+      fi
+      
+      # Step 5: Deploy to Vercel
+      echo "" | tee -a ../build.log
+      echo "=== Step 5: Deploying to Vercel ===" | tee -a ../build.log
+      DEPLOY_OUT=$(vercel deploy --prod --yes --no-clipboard --token "$VERCEL_TOKEN" --name "$PROJECT_NAME_SAFE" 2>&1) || true
+      echo "$DEPLOY_OUT" | tee -a ../build.log
+      
+      # Extract deployment URL
+      DEPLOY_URL=$(echo "$DEPLOY_OUT" | grep -oE 'https://[a-zA-Z0-9.-]+\.vercel\.app[^ ]*' | head -1 || echo "")
+      
+      if [ -z "$DEPLOY_URL" ]; then
+        DEPLOY_URL=$(echo "$DEPLOY_OUT" | grep -oE 'https://[^ ]+' | head -1 || echo "deployment-failed")
+      fi
+      
+      cd ..
+      echo "$DEPLOY_URL" > preview_url.txt
+      
+      # Final summary
+      echo "" | tee -a build.log
+      echo "=== Build Complete ===" | tee -a build.log
+      echo "End time: $(date -Iseconds)" | tee -a build.log
+      echo "Preview URL: $DEPLOY_URL" | tee -a build.log
+      
+      # Emit Kestra outputs for structured data (must be valid JSON)
+      echo "::$(printf '{"outputs":{"previewUrl":"%s","projectName":"%s"}}' "$DEPLOY_URL" "$PROJECT_NAME_SAFE")::"
+
+  - id: log-result
+    type: io.kestra.plugin.core.log.Log
+    description: Log the build result
+    message: |
+      Build completed!
+      Preview URL: {{ outputs['build-and-deploy'].vars.previewUrl }}
+      Project: {{ outputs['build-and-deploy'].vars.projectName }}
+
+outputs:
+  - id: preview_url
+    type: STRING
+    description: The Vercel deployment URL
+    value: "{{ outputs['build-and-deploy'].vars.previewUrl }}"
+
+  - id: project_name
+    type: STRING
+    description: The sanitized project name
+    value: "{{ outputs['build-and-deploy'].vars.projectName }}"
+
+  - id: build_log
+    type: FILE
+    description: Full build log
+    value: "{{ outputs['build-and-deploy'].outputFiles['build.log'] }}"
+
+  - id: generated_code
+    type: FILE
+    description: Generated source code
+    value: "{{ outputs['build-and-deploy'].outputFiles['generated_code.txt'] }}"
+
+errors:
+  - id: log-error
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      Build failed!
+      Execution ID: {{ execution.id }}
+      Error: {{ errorLogs() }}
+
+triggers:
+  - id: webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: build-app
+
+  - id: schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    disabled: true
+    cron: "0 0 * * *"
+    description: Daily build (disabled by default)
