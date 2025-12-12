@@ -1,6 +1,3 @@
-<<<<<<< HEAD
-# Auto-SRE
-=======
 # Kestra + Cline AI Automated App Builder
 
 An automated pipeline that uses **Kestra** orchestration with **Cline AI** to generate Next.js applications and deploy them to **Vercel** - all from a simple text prompt.
@@ -210,4 +207,3 @@ MIT
 ---
 
 Built with ❤️ using Kestra, Cline AI, and Vercel
->>>>>>> 1c326198db02af41b634dccfb16eecb56de62768
