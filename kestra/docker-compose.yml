@@ -1,6 +1,6 @@
 services:
   kestra:
-    image: kestra/kestra:v0.18.0
+    image: kestra/kestra:latest
     container_name: kestra
     user: root
     command: server standalone
@@ -12,7 +12,8 @@ services:
         kestra:
           server:
             basic-auth:
-              enabled: false
+              username: admin@kestra.io
+              password: Admin1234
           repository:
             type: memory
           queue:
@@ -26,6 +27,24 @@ services:
             type: env
             env:
               prefix: SECRET_
+        micronaut:
+          server:
+            cors:
+              enabled: true
+              configurations:
+                web:
+                  allowedOrigins:
+                    - "*"
+                  allowedMethods:
+                    - "HEAD"
+                    - "GET"
+                    - "POST"
+                    - "PUT"
+                    - "DELETE"
+                    - "OPTIONS"
+                  allowedHeaders:
+                    - "*"
+                  allowCredentials: false # Must be false when allowedOrigins is "*"
       # Secrets - these will be available as secret('...') in flows
       SECRET_GEMINI_API_KEY: ${GEMINI_API_KEY}
       # SECRET_OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
@@ -42,7 +61,7 @@ services:
     networks:
       - kestra-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
       interval: 30s
       timeout: 10s
       retries: 3

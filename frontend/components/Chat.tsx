@@ -1,7 +1,7 @@
 'use client';
 
-import { useState } from 'react';
-import { triggerFactoryBuilder, triggerUpdateFeature, getExecutionStatus, checkHealth } from '@/lib/kestra-client';
+import { useState, useEffect, useRef } from 'react';
+import { triggerFactoryBuilder, triggerUpdateFeature, getExecutionStatus, checkHealth, ExecutionStatus } from '@/lib/kestra-client';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -12,292 +12,198 @@ interface Message {
 interface ChatProps {
   onPreviewUrl: (url: string) => void;
   onBuildStart?: () => void;
-  onGitHubReady?: (repoInfo: { repoUrl: string; repoName: string; vercelImportUrl: string }) => void;
-  currentRepoUrl?: string | null; // For tracking if we have an existing repo
+  currentRepoUrl?: string | null;
 }
 
-export default function Chat({ onPreviewUrl, onBuildStart, onGitHubReady, currentRepoUrl }: ChatProps) {
+export default function Chat({ onPreviewUrl, onBuildStart, currentRepoUrl }: ChatProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
-  const [executionId, setExecutionId] = useState<string | null>(null);
-  const [lastPrompt, setLastPrompt] = useState<string | null>(null);
-  const [statusMessage, setStatusMessage] = useState<string>('Idle');
-  const [statusType, setStatusType] = useState<'info' | 'success' | 'error'>('info');
+  const [statusMessage, setStatusMessage] = useState('Idle');
+  
+  // Use refs for polling to avoid closure staleness issues if we were using useEffect dependencies loosely
+  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
-  const handleSend = async (promptOverride?: string) => {
-    const prompt = (promptOverride ?? input).trim();
-    if (!prompt || loading) return;
+  const addMessage = (role: 'user' | 'assistant', content: string) => {
+    setMessages(prev => [...prev, { role, content, timestamp: new Date() }]);
+  };
 
-    const userMessage: Message = {
-      role: 'user',
-      content: prompt,
-      timestamp: new Date(),
-    };
-
-    setMessages((prev) => [...prev, userMessage]);
-    if (!promptOverride) setInput('');
-    setLastPrompt(prompt);
-    setLoading(true);
-    setStatusMessage('Checking Kestra health...');
-    setStatusType('info');
-
-    try {
-      const healthy = await checkHealth();
-      if (!healthy) {
-        setStatusMessage('Kestra is unreachable. Please ensure it is running.');
-        setStatusType('error');
-        setLoading(false);
-        return;
-      }
-
-      setStatusMessage('Building... connecting to Kestra');
-      onBuildStart?.();
-
-      // Determine which flow to use
-      // If we have a repo URL, use update-feature; otherwise use factory-builder-v2
-      const response = currentRepoUrl
-        ? await triggerUpdateFeature(prompt, currentRepoUrl)
-        : await triggerFactoryBuilder(prompt);
-      setExecutionId(response.id);
-
-      // Add loading message
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: 'assistant',
-          content: 'Building your app... This may take a few minutes.',
-          timestamp: new Date(),
-        },
-      ]);
-
-      // Poll for completion
-      pollExecutionStatus(response.id);
-    } catch (error) {
-      setStatusMessage('Error triggering build. Please retry.');
-      setStatusType('error');
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: 'assistant',
-          content: `Error: ${error instanceof Error ? error.message : 'Unknown error'}`,
-          timestamp: new Date(),
-        },
-      ]);
-      setLoading(false);
+  const stopPolling = () => {
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
     }
   };
 
-  const pollExecutionStatus = async (id: string) => {
-    const maxAttempts = 60; // 2 minutes max
-    let attempts = 0;
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => stopPolling();
+  }, []);
 
-    const interval = setInterval(async () => {
+  const handleSend = async () => {
+    const prompt = input.trim();
+    if (!prompt || loading) return;
+
+    // Reset state
+    setInput('');
+    setLoading(true);
+    setStatusMessage('Initializing...');
+    addMessage('user', prompt);
+
+    try {
+      // 1. Check Health
+      const isHealthy = await checkHealth();
+      if (!isHealthy) {
+        throw new Error('Backend is unreachable (health check failed).');
+      }
+
+      // 2. Trigger Build
+      setStatusMessage('Triggering build...');
+      onBuildStart?.();
+      
+      const triggerResponse = currentRepoUrl 
+        ? await triggerUpdateFeature(prompt, currentRepoUrl)
+        : await triggerFactoryBuilder(prompt);
+
+      const executionId = triggerResponse.id;
+      addMessage('assistant', `Build started! Execution ID: ${executionId}. Waiting for completion...`);
+      setStatusMessage('Build running...');
+
+      // 3. Poll for Completion
+      startPolling(executionId);
+
+    } catch (err) {
+      console.error(err);
+      setLoading(false);
+      setStatusMessage('Error');
+      addMessage('assistant', `❌ Error: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    }
+  };
+
+  const startPolling = (executionId: string) => {
+    let attempts = 0;
+    const maxAttempts = 600; // 20 minutes (2s interval)
+
+    stopPolling(); // Ensure no duplicate pollers
+
+    pollIntervalRef.current = setInterval(async () => {
       attempts++;
+      
       try {
-        const status = await getExecutionStatus(id);
+        const status = await getExecutionStatus(executionId);
+        console.log(`[Poll #${attempts}] Status:`, status.status, status);
+
+        // Update status message with current state if available
+        setStatusMessage(`Status: ${status.status} (Attempt ${attempts})`);
 
         if (status.status === 'SUCCESS') {
-          clearInterval(interval);
+          stopPolling();
           setLoading(false);
-          setStatusMessage('Build complete');
-          setStatusType('success');
-
-          const outputs = status.outputs || {};
-          const buildStatus = outputs.status;
-
-          // Handle github_ready status (new app created, needs Vercel connection)
-          // Check both possible output formats: status field or direct repo fields
-          const repoUrl = outputs.repoUrl || outputs.githubRepo;
-          const repoName = outputs.repoName || outputs.githubRepoName;
-          
-          if ((buildStatus === 'github_ready' || (!buildStatus && repoUrl && !outputs.previewUrl)) && repoUrl && repoName) {
-            // Extract owner and repo from URL (e.g., https://github.com/owner/repo or owner/repo)
-            let owner = '';
-            let repo = repoName;
-            
-            // Try to extract from full URL
-            const urlMatch = repoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
-            if (urlMatch) {
-              owner = urlMatch[1];
-              repo = urlMatch[2];
-            } else {
-              // Try owner/repo format
-              const ownerRepoMatch = repoUrl.match(/([^\/]+)\/([^\/]+)/);
-              if (ownerRepoMatch) {
-                owner = ownerRepoMatch[1];
-                repo = ownerRepoMatch[2];
-              }
-            }
-            
-            const vercelImportUrl = owner 
-              ? `https://vercel.com/new/import?s=https://github.com/${owner}/${repo}`
-              : `https://vercel.com/new/import?s=${repoUrl}`;
-            
-            onGitHubReady?.({ 
-              repoUrl: repoUrl.startsWith('http') ? repoUrl : `https://github.com/${repoUrl}`, 
-              repoName: repo, 
-              vercelImportUrl 
-            });
-            
-            setMessages((prev) => [
-              ...prev,
-              {
-                role: 'assistant',
-                content: `✅ Your app is ready on GitHub!\n\nRepository: ${repo}\n\nClick "Connect to Vercel" to enable live preview.`,
-                timestamp: new Date(),
-              },
-            ]);
-          }
-          // Handle direct preview URL (legacy or auto-deployed after Vercel connection)
-          else if (outputs.previewUrl) {
-            onPreviewUrl(outputs.previewUrl);
-            setMessages((prev) => [
-              ...prev,
-              {
-                role: 'assistant',
-                content: `✅ Build complete! Preview URL: ${outputs.previewUrl}`,
-                timestamp: new Date(),
-              },
-            ]);
-          }
-          // Fallback message
-          else {
-            setMessages((prev) => [
-              ...prev,
-              {
-                role: 'assistant',
-                content: `✅ Build complete! Check Kestra UI for details.`,
-                timestamp: new Date(),
-              },
-            ]);
-          }
-        } else if (status.status === 'FAILED') {
-          clearInterval(interval);
+          setStatusMessage('Success!');
+          handleSuccess(status);
+        } else if (status.status === 'FAILED' || status.status === 'KILLED' || status.status === 'WARNING') {
+          stopPolling();
           setLoading(false);
-          setStatusMessage('Build failed. Please retry.');
-          setStatusType('error');
-          setMessages((prev) => [
-            ...prev,
-            {
-              role: 'assistant',
-              content: '❌ Build failed. Check Kestra logs for details.',
-              timestamp: new Date(),
-            },
-          ]);
+          setStatusMessage('Failed');
+          addMessage('assistant', `❌ Build ended with status: ${status.status}`);
         } else if (attempts >= maxAttempts) {
-          clearInterval(interval);
+          stopPolling();
           setLoading(false);
-          setStatusMessage('Build timed out. Please retry.');
-          setStatusType('error');
-          setMessages((prev) => [
-            ...prev,
-            {
-              role: 'assistant',
-              content: '⏱️ Build timed out. Check Kestra UI for status.',
-              timestamp: new Date(),
-            },
-          ]);
+          setStatusMessage('Timeout');
+          addMessage('assistant', '⏱️ Build timed out waiting for completion.');
         }
-      } catch (error) {
-        clearInterval(interval);
-        setLoading(false);
-        setStatusMessage('Error checking status. Please retry.');
-        setStatusType('error');
-        setMessages((prev) => [
-          ...prev,
-          {
-            role: 'assistant',
-            content: `Error checking status: ${error instanceof Error ? error.message : 'Unknown error'}`,
-            timestamp: new Date(),
-          },
-        ]);
+      } catch (err) {
+        console.warn('Poll error:', err);
+        // Don't stop polling on transient network errors, just log
       }
-    }, 2000); // Poll every 2 seconds
+    }, 2000);
+  };
+
+  const handleSuccess = (status: ExecutionStatus) => {
+    console.log('Handling Success', status);
+    
+    // Extraction Logic
+    let previewUrl: string | undefined;
+    
+    // 1. Try generic output
+    if (status.outputs) {
+      previewUrl = status.outputs.previewUrl || status.outputs.preview_url;
+    }
+
+    // 2. Deep search in tasks if not found
+    if (!previewUrl && status.taskRunList) {
+      const buildTask = status.taskRunList.find(t => t.taskId === 'build-and-deploy');
+      if (buildTask?.outputs?.vars) {
+        previewUrl = buildTask.outputs.vars.previewUrl || buildTask.outputs.vars.preview_url;
+      }
+    }
+
+    if (previewUrl) {
+      console.log('Preview URL found:', previewUrl);
+      onPreviewUrl(previewUrl);
+      addMessage('assistant', `✅ Build Complete! Loading preview...`);
+    } else {
+      console.warn('No preview URL found in outputs', status);
+      addMessage('assistant', '✅ Build finished, but could not auto-detect the Preview URL. Please check Kestra logs.');
+    }
   };
 
   return (
-    <div className="flex flex-col h-full">
-      {/* Status banner */}
-      <div
-        className={`border-b px-4 py-2 text-sm ${
-          statusType === 'success'
-            ? 'bg-green-50 text-green-800'
-            : statusType === 'error'
-            ? 'bg-red-50 text-red-800'
-            : 'bg-blue-50 text-blue-800'
-        }`}
-      >
-        {statusMessage}
-      </div>
-
-      {/* Messages */}
+    <div className="flex flex-col h-full bg-white">
+      {/* Messages Area */}
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
         {messages.length === 0 && (
-          <div className="text-gray-500 text-center mt-8">
-            Enter a prompt to build your Next.js app...
+          <div className="h-full flex flex-col items-center justify-center text-gray-400">
+            <p>Ready to build.</p>
+            <p className="text-sm">Type a prompt to start.</p>
           </div>
         )}
-        {messages.map((msg, idx) => (
-          <div
-            key={idx}
-            className={`flex ${
-              msg.role === 'user' ? 'justify-end' : 'justify-start'
-            }`}
-          >
-            <div
-              className={`max-w-[80%] rounded-lg p-3 ${
-                msg.role === 'user'
-                  ? 'bg-blue-500 text-white'
-                  : 'bg-gray-200 text-gray-800'
-              }`}
-            >
-              {msg.content}
-            </div>
+        
+        {messages.map((m, i) => (
+          <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+             <div className={`max-w-[85%] rounded-lg p-3 ${
+               m.role === 'user' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-800'
+             }`}>
+               <p className="whitespace-pre-wrap">{m.content}</p>
+               <span className="text-xs opacity-50 block mt-1">
+                 {m.timestamp.toLocaleTimeString()}
+               </span>
+             </div>
           </div>
         ))}
+        
         {loading && (
           <div className="flex justify-start">
-            <div className="bg-gray-200 rounded-lg p-3">
-              <div className="flex items-center space-x-2">
-                <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-gray-600"></div>
-                <span>Building...</span>
-              </div>
-            </div>
+             <div className="bg-gray-100 rounded-lg p-3 animate-pulse">
+               Building... ({statusMessage})
+             </div>
           </div>
         )}
       </div>
 
-      {/* Input */}
-      <div className="border-t p-4">
-        <div className="flex space-x-2">
+      {/* Input Area */}
+      <div className="border-t p-4 bg-gray-50">
+        <div className="flex gap-2">
           <input
-            type="text"
+            className="flex-1 border border-gray-300 rounded-md px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 text-black"
+            placeholder="Describe your app..."
             value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleSend()}
-            placeholder="Describe your app (e.g., 'Create a todo app with add/delete')"
-            className="flex-1 border rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            onChange={e => setInput(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && handleSend()}
             disabled={loading}
           />
           <button
-            onClick={() => handleSend()}
+            className="bg-blue-600 text-white px-6 py-2 rounded-md font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+            onClick={handleSend}
             disabled={loading || !input.trim()}
-            className="bg-blue-500 text-white px-6 py-2 rounded-lg hover:bg-blue-600 disabled:bg-gray-300 disabled:cursor-not-allowed"
           >
-            Send
+            {loading ? 'Building...' : 'Build'}
           </button>
-          {!loading && statusType === 'error' && lastPrompt && (
-            <button
-              onClick={() => handleSend(lastPrompt)}
-              className="bg-gray-200 text-gray-800 px-4 py-2 rounded-lg hover:bg-gray-300"
-            >
-              Retry
-            </button>
-          )}
+        </div>
+        <div className="text-xs text-gray-400 mt-2 text-center">
+          Status: {statusMessage}
         </div>
       </div>
     </div>
   );
 }
-

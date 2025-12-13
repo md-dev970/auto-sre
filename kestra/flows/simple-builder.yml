@@ -59,9 +59,9 @@ tasks:
       - generated_code.txt
     env:
       USER_PROMPT: "{{ inputs.prompt }}"
-      GEMINI_API_KEY: "{{ secret('GEMINI_API_KEY') }}"
+      GEMINI_API_KEY: "AIzaSyArAFsJJb4MMHW8wJKPqtFvC4hsd1UjUlE"
       # OPENROUTER_API_KEY: "{{ secret('OPENROUTER_API_KEY') }}"
-      VERCEL_TOKEN: "{{ secret('VERCEL_TOKEN') }}"
+      VERCEL_TOKEN: "gtKBQIGzft6pSumfg9qMcHTX"
       PROJECT_NAME: "{{ inputs.project_prefix }}-{{ execution.id }}"
       NODE_OPTIONS: "--max-old-space-size=8192"
       HOME: "/root"
@@ -111,11 +111,11 @@ tasks:
       # Step 3: Run Cline AI with retry
       echo "" | tee -a ../build.log
       echo "=== Step 3: Running Cline AI ===" | tee -a ../build.log
-      CLINE_PROMPT="You are in a Next.js 14 App Router project. TASK: COMPLETELY REPLACE app/page.tsx for: $USER_PROMPT. RULES: 1) Add 'use client' at top 2) Replace ALL default template code 3) Use Tailwind CSS 4) ONLY modify files - DO NOT run npm run dev or any commands 5) App deploys automatically to Vercel. Just edit files and finish."
+      CLINE_PROMPT="You are in a Next.js 14 App Router project. TASK: COMPLETELY REPLACE app/page.tsx for: $USER_PROMPT. Rules: Add 'use client', replace default code, use Tailwind. ONLY modify files. App deploys automatically."
       
       # Try Cline up to 3 times
       for attempt in 1 2 3; do
-        echo "Cline attempt $attempt..." | tee -a ../build.log
+        echo " Cline attempt $attempt..." | tee -a ../build.log
         if cline "$CLINE_PROMPT" -y --oneshot 2>&1 | tee -a ../build.log; then
           echo "Cline completed successfully on attempt $attempt" | tee -a ../build.log
           break
@@ -133,7 +133,7 @@ tasks:
         echo "Project: $PROJECT_NAME_SAFE"
         echo "Timestamp: $(date -Iseconds)"
         echo ""
-        echo "--- app/page.tsx ---"
+        echo "=== app/page.tsx ==="
       } > ../generated_code.txt
       
       if [ -f "app/page.tsx" ]; then
@@ -147,7 +147,7 @@ tasks:
       # Capture layout if exists
       if [ -f "app/layout.tsx" ]; then
         echo "" >> ../generated_code.txt
-        echo "--- app/layout.tsx ---" >> ../generated_code.txt
+        echo "=== app/layout.tsx ===" >> ../generated_code.txt
         cat app/layout.tsx >> ../generated_code.txt
         echo "Captured app/layout.tsx" | tee -a ../build.log
       fi

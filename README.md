@@ -1,209 +1,73 @@
-# Kestra + Cline AI Automated App Builder
+# Kestra + Cline Auto-SRE Builder
 
-An automated pipeline that uses **Kestra** orchestration with **Cline AI** to generate Next.js applications and deploy them to **Vercel** - all from a simple text prompt.
+This project is an automated pipeline that uses **Kestra** to orchestrate **Cline AI** (powered by Gemini) for generating and deploying Next.js applications to **Vercel** via a simple chat interface.
 
-## 🏗️ Architecture
+## 🚀 What it does
+1.  **Takes a user prompt** (e.g., "Build a landing page for a coffee shop").
+2.  **Orchestrates a build environment** using Docker and Kestra.
+3.  **Uses AI (Cline)** to generate the full Next.js application code.
+4.  **Deploys the app** automatically to Vercel.
+5.  **Returns a preview link** to view the live application.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         KESTRA                                   │
-│                    (Orchestration Engine)                        │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │                    Flow: simple-builder                  │    │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐│    │
-│  │  │ Log Start│→ │Build Task│→ │Log Result│→ │  Output  ││    │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────────┘│    │
-│  └─────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    DOCKER CONTAINER                              │
-│                   (kestra-cline:latest)                          │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐  │
-│  │   Node.js   │  │  Cline CLI  │  │      Vercel CLI         │  │
-│  │    v22+     │  │   v1.0.8    │  │       v49+              │  │
-│  └─────────────┘  └─────────────┘  └─────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      BUILD PIPELINE                              │
-│  1. Create Next.js project (TypeScript + Tailwind)              │
-│  2. Authenticate Cline with Gemini API                          │
-│  3. Run Cline AI to generate/modify code                        │
-│  4. Deploy to Vercel                                            │
-│  5. Return preview URL                                          │
-└─────────────────────────────────────────────────────────────────┘
-```
+## 🛠️ Setup & Run
 
-## 📁 Project Structure
+### 1. Prerequisites
+- Docker & Docker Compose
+- API Keys:
+    - **Gemini API Key** (from Google AI Studio)
+    - **Vercel Token** (from Vercel Account Settings)
 
-```
-.
-├── docker-compose.yml       # Kestra service configuration
-├── Dockerfile.kestra-cline  # Docker image with Cline + Vercel CLI
-├── .env                     # API keys (Base64 encoded)
-├── flows/
-│   └── simple-builder.yml   # Kestra flow definition
-└── README.md
-```
+### 2. Configure Secrets
+Kestra requires Base64-encoded secrets in the `.env` file.
 
-## 🔐 API Key Encryption
+1.  **Encode your keys:**
+    *   **Windows (Easy Method):** Use the included helper script in `kestra/base64.bat`:
+        ```cmd
+        .\kestra\base64.bat "YOUR_KEY_HERE"
+        ```
+    *   **Linux/Mac:**
+        ```bash
+        echo -n 'YOUR_KEY_HERE' | base64
+        ```
+    *   **PowerShell:**
+        ```powershell
+        [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("YOUR_KEY"))
+        ```
 
-Kestra requires secrets to be **Base64 encoded**. Here's how to encrypt your API keys:
+2.  **Create `.env` file in this directory:**
+    ```env
+    GEMINI_API_KEY=VGhpcyBpcy...
+    VERCEL_TOKEN=ZGVwbG95bW...
+    ```
 
-### Step 1: Get Your API Keys
-
-| Service | Get Key From |
-|---------|--------------|
-| Gemini API | https://aistudio.google.com/apikey |
-| Vercel Token | https://vercel.com/account/tokens |
-| OpenRouter (optional) | https://openrouter.ai/keys |
-
-### Step 2: Base64 Encode Each Key
-
-```bash
-# Encode Gemini API Key
-echo -n 'YOUR_GEMINI_API_KEY' | base64
-
-# Encode Vercel Token
-echo -n 'YOUR_VERCEL_TOKEN' | base64
-
-# Encode OpenRouter Key (optional)
-echo -n 'YOUR_OPENROUTER_KEY' | base64
-```
-
-### Step 3: Add to .env File
-
-```env
-# .env file - All values must be Base64 encoded!
-
-GEMINI_API_KEY=QUl6YVN5... (your base64 encoded key)
-VERCEL_TOKEN=RFpGVGNs... (your base64 encoded token)
-# OPENROUTER_API_KEY=c2stb3... (optional, base64 encoded)
-```
-
-### Example Encoding
-
-```bash
-# If your Gemini key is: AIzaSyABC123xyz
-echo -n 'AIzaSyABC123xyz' | base64
-# Output: QUl6YVN5QUJDMTIzeHl6
-
-# To decode and verify:
-echo 'QUl6YVN5QUJDMTIzeHl6' | base64 -d
-# Output: AIzaSyABC123xyz
-```
-
-## 🚀 Quick Start
-
-### 1. Build the Docker Image
-
+### 3. Build the Docker Image
 ```bash
 docker build -f Dockerfile.kestra-cline -t kestra-cline:latest .
 ```
 
-### 2. Configure API Keys
-
-Edit `.env` with your Base64-encoded keys (see encryption section above).
-
-### 3. Start Kestra
-
+### 4. Start the Backend (Kestra)
 ```bash
 docker compose up -d
 ```
+The Kestra UI will be available at `http://localhost:8080`.
 
-### 4. Access Kestra UI
+### 5. Import Kestra Flow
+Before using the frontend, you must import the `simple-builder.yml` flow into your Kestra instance.
+-   Access the Kestra UI at `http://localhost:8080`.
+-   Go to "Flows", then click "Create" or "Upload".
+-   Upload the `auto-sre/kestra/flows/simple-builder.yml` file.
 
-Open http://localhost:8080 in your browser.
-
-### 5. Run a Build
-
-Via Kestra UI:
-- Go to Flows → production → simple-builder
-- Click "Execute"
-- Enter your prompt (e.g., "A todo app with add/delete functionality")
-- Click "Execute"
-
-Via API:
+### 6. Start the Frontend (Chat Interface)
 ```bash
-curl -X POST "http://localhost:8080/api/v1/executions/production/simple-builder" \
-  -H "Content-Type: multipart/form-data" \
-  -F 'prompt=A counter app with + and - buttons' \
-  -F 'project_prefix=myapp'
+cd frontend
+npm install
+npm run dev
 ```
+Open `http://localhost:3000` to start building apps!
 
-## ⚙️ Configuration
+## ⚠️ Vercel Preview Note
+Due to browser security policies (X-Frame-Options) and Vercel's default authentication protections, generated applications are not embedded directly in the chat. 
 
-### Supported AI Providers
-
-| Provider | Model | Free Tier |
-|----------|-------|-----------|
-| Gemini | gemini-2.5-flash | 1500 req/day |
-| Gemini | gemini-2.0-flash | 1500 req/day |
-| OpenRouter | nex-agi/deepseek-v3.1-nex-n1:free | 50 req/day |
-
-### Changing the AI Model
-
-Edit `flows/simple-builder.yml` and modify the auth line:
-
-```bash
-# For Gemini
-cline auth --provider gemini --apikey "$GEMINI_API_KEY" --modelid "gemini-2.5-flash"
-
-# For OpenRouter
-cline auth --provider openrouter --apikey "$OPENROUTER_API_KEY" --modelid "nex-agi/deepseek-v3.1-nex-n1:free"
-```
-
-### Vercel Deployment Protection
-
-By default, Vercel enables deployment protection. To make deployments public:
-
-1. Go to https://vercel.com/dashboard
-2. Select your project
-3. Settings → Deployment Protection
-4. Set to "No Protection" or disable authentication
-
-## 🔧 Troubleshooting
-
-### Cline Auth Fails
-
-Ensure `HOME` environment variable is set in the flow:
-```yaml
-env:
-  HOME: "/root"
-```
-
-### Rate Limit Errors
-
-Switch to a different model or wait for quota reset (midnight Pacific Time).
-
-### Build Fails
-
-Check the build logs in Kestra UI for detailed error messages.
-
-## 📊 Flow Outputs
-
-Each execution produces:
-
-| Output | Description |
-|--------|-------------|
-| `preview_url` | Vercel deployment URL |
-| `project_name` | Generated project name |
-| `build.log` | Full build log |
-| `generated_code.txt` | Generated source code |
-
-## 🛑 Stopping the Service
-
-```bash
-docker compose down
-```
-
-## 📝 License
-
-MIT
+The interface provides an **"Open Application ↗"** button to launch your deployed app in a new, secure tab where you can log in to Vercel if required.
 
 ---
-
-Built with ❤️ using Kestra, Cline AI, and Vercel

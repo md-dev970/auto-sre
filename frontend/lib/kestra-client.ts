@@ -1,4 +1,4 @@
-const KESTRA_URL = process.env.NEXT_PUBLIC_KESTRA_URL || 'http://localhost:8080';
+const KESTRA_URL = '/kestra-api';
 
 export interface ExecutionResponse {
   id: string;
@@ -7,62 +7,50 @@ export interface ExecutionResponse {
 
 export interface ExecutionStatus {
   id: string;
-  status: 'RUNNING' | 'SUCCESS' | 'FAILED';
+  state: {
+    current: 'RUNNING' | 'SUCCESS' | 'FAILED' | 'CREATED' | 'WARNING' | 'KILLED';
+  };
+  // We map state.current to this for easier consumption, or just use state.current
+  status?: string; 
   outputs?: {
     previewUrl?: string;
+    preview_url?: string;
     projectName?: string;
     repoUrl?: string;
     repoName?: string;
-    status?: string; // 'github_ready' | 'deployed'
-    // For factory-builder-v2 flow
+    status?: string; 
     githubRepo?: string;
     githubRepoName?: string;
   };
-}
-
-export interface GitHubRepoInfo {
-  repoUrl: string;
-  repoName: string;
-  owner: string;
-  vercelImportUrl: string;
+  taskRunList?: Array<{
+    id: string;
+    taskId: string;
+    outputs?: {
+      vars?: {
+        previewUrl?: string;
+        preview_url?: string;
+        repoUrl?: string;
+        repoName?: string;
+      };
+    };
+  }>;
 }
 
 // Trigger factory-builder-v2 flow (creates new app)
 // Falls back to simple-builder if factory-builder-v2 doesn't exist
 export async function triggerFactoryBuilder(prompt: string): Promise<ExecutionResponse> {
-  // Try factory-builder-v2 first (new flow with GitHub-first approach)
-  let response = await fetch(
-    `${KESTRA_URL}/api/v1/executions/trigger/production/factory-builder-v2`,
+  const formData = new FormData();
+  formData.append('prompt', prompt);
+
+  // Directly trigger simple-builder using FormData (multipart/form-data)
+  // This matches the curl example in README and avoids 415 Unsupported Media Type errors
+  const response = await fetch(
+    `${KESTRA_URL}/executions/trigger/production/simple-builder`,
     {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        inputs: {
-          prompt,
-        },
-      }),
+      body: formData,
     }
   );
-
-  // Fallback to simple-builder if factory-builder-v2 doesn't exist
-  if (!response.ok && response.status === 404) {
-    response = await fetch(
-      `${KESTRA_URL}/api/v1/executions/trigger/production/simple-builder`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          inputs: {
-            prompt,
-          },
-        }),
-      }
-    );
-  }
 
   if (!response.ok) {
     throw new Error(`Failed to trigger flow: ${response.statusText}`);
@@ -77,7 +65,7 @@ export async function triggerUpdateFeature(
   repoUrl: string
 ): Promise<ExecutionResponse> {
   const response = await fetch(
-    `${KESTRA_URL}/api/v1/executions/trigger/production/update-feature`,
+    `${KESTRA_URL}/executions/trigger/production/update-feature`,
     {
       method: 'POST',
       headers: {
@@ -108,19 +96,27 @@ export async function getExecutionStatus(
   executionId: string
 ): Promise<ExecutionStatus> {
   const response = await fetch(
-    `${KESTRA_URL}/api/v1/executions/${executionId}`
+    `${KESTRA_URL}/executions/${executionId}`
   );
 
   if (!response.ok) {
     throw new Error(`Failed to get execution status: ${response.statusText}`);
   }
 
-  return response.json();
+  const data = await response.json();
+  
+  // Map Kestra's nested state.current to a top-level status property for compatibility
+  // or ensure the consumer checks data.state.current
+  return {
+    ...data,
+    status: data.state?.current // Polyfill top-level status
+  };
 }
 
 export async function checkHealth(): Promise<boolean> {
   try {
-    const response = await fetch(`${KESTRA_URL}/api/v1/health`, {
+    // Check /configs as it's a reliable endpoint that returns 200 when server is up
+    const response = await fetch(`${KESTRA_URL}/configs`, {
       method: 'GET',
     });
     return response.ok;
@@ -128,4 +124,3 @@ export async function checkHealth(): Promise<boolean> {
     return false;
   }
 }
-
