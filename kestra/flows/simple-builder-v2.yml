@@ -1,0 +1,409 @@
+id: simple-builder-v2
+namespace: production
+description: |
+  Build Next.js app with GitHub + Vercel integration.
+  
+  Flow:
+  1. Create GitHub repo (GitHub API)
+  2. Create Next.js project
+  3. Run Cline with AI provider chain
+  4. Push to GitHub
+  5. Check if Vercel connected:
+     YES → Wait for auto-deploy → Return preview URL
+     NO  → Return Vercel connect URL
+
+labels:
+  env: production
+  team: platform
+  type: ai-builder
+  version: v2
+
+inputs:
+  - id: prompt
+    type: STRING
+    description: User prompt describing the app to build
+    required: true
+
+  - id: project_prefix
+    type: STRING
+    description: Optional prefix for the project name
+    required: false
+    defaults: app
+
+  - id: github_owner
+    type: STRING
+    description: GitHub username or organization
+    required: false
+    defaults: Ayoub-Marzouki
+
+variables:
+  project_name: "{{ inputs.project_prefix }}-{{ execution.id | lower }}"
+  branch: main
+
+tasks:
+  - id: log-start
+    type: io.kestra.plugin.core.log.Log
+    description: Log the start of the build process
+    message: |
+      Starting build for prompt: {{ inputs.prompt }}
+      Execution ID: {{ execution.id }}
+      Project: {{ vars.project_name }}
+
+  - id: build-and-deploy
+    type: io.kestra.plugin.scripts.shell.Script
+    description: Build Next.js app with Cline AI, push to GitHub, check Vercel deployment
+    warningOnStdErr: false
+    timeout: PT30M
+    interpreter:
+      - /bin/bash
+      - -c
+    retry:
+      type: constant
+      maxAttempts: 2
+      interval: PT1M
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      image: kestra-cline:latest
+      pullPolicy: NEVER
+      memory:
+        limit: 6g
+        swap: 1g
+    outputFiles:
+      - build.log
+      - output.json
+      - code_snapshot.txt
+    env:
+      USER_PROMPT: "{{ inputs.prompt }}"
+      PROJECT_NAME: "{{ vars.project_name }}"
+      BRANCH: "{{ vars.branch }}"
+      GITHUB_OWNER: "{{ inputs.github_owner }}"
+      GEMINI_API_KEY: ""
+      GITHUB_TOKEN: ""
+      VERCEL_TOKEN: ""
+      NODE_OPTIONS: "--max-old-space-size=2048"
+      HOME: "/root"
+      NPM_CONFIG_LOGLEVEL: "error"
+      NPM_CONFIG_PROGRESS: "false"
+    script: |
+      #!/bin/bash
+      set -e
+      
+      # Ensure HOME is set for Cline
+      export HOME="${HOME:-/root}"
+      mkdir -p "$HOME/.cline"
+      
+      # Initialize output files
+      echo '{"status":"started"}' > output.json
+      echo "" > code_snapshot.txt
+      
+      # Start logging
+      {
+        echo "=== Kestra + Cline + GitHub + Vercel Pipeline ==="
+        echo "Start time: $(date -Iseconds)"
+        echo "Execution ID: ${KESTRA_EXECUTION_ID:-unknown}"
+        echo "Project: $PROJECT_NAME"
+        echo "Branch: $BRANCH"
+        echo "HOME: $HOME"
+        echo ""
+      } | tee build.log
+      
+      # Sanitize and truncate project name to 40 chars to be safe
+      PROJECT_NAME_SAFE=$(echo "$PROJECT_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-40)
+      echo "Using project name (sanitized): $PROJECT_NAME_SAFE" | tee -a build.log
+
+      # Step 1: Configure Git
+      echo "=== Step 1: Configure Git ===" | tee -a build.log
+      git config --global user.email "kestra-bot@auto-sre.dev"
+      git config --global user.name "Kestra Bot"
+      git config --global init.defaultBranch main
+      
+      # Step 2: Create GitHub repository
+      echo "" | tee -a build.log
+      echo "=== Step 2: Create GitHub Repository ===" | tee -a build.log
+      REPO_URL_PUBLIC="https://github.com/${GITHUB_OWNER}/${PROJECT_NAME}"
+      REPO_URL="https://${GITHUB_TOKEN}@github.com/${GITHUB_OWNER}/${PROJECT_NAME}.git"
+      
+      # Check if repo exists
+      REPO_CHECK=$(curl -s -o /dev/null -w "%{http_code}" \
+        -H "Authorization: token ${GITHUB_TOKEN}" \
+        "https://api.github.com/repos/${GITHUB_OWNER}/${PROJECT_NAME}")
+      
+      if [ "$REPO_CHECK" = "200" ]; then
+        echo "Repository already exists: $REPO_URL_PUBLIC" | tee -a build.log
+      else
+        echo "Creating new repository..." | tee -a build.log
+        CREATE_RESPONSE=$(curl -s -X POST \
+          -H "Authorization: token ${GITHUB_TOKEN}" \
+          -H "Accept: application/vnd.github.v3+json" \
+          https://api.github.com/user/repos \
+          -d "{\"name\":\"${PROJECT_NAME}\",\"private\":false,\"auto_init\":false}")
+        
+        if echo "$CREATE_RESPONSE" | jq -e '.id' > /dev/null 2>&1; then
+          echo "✓ Repository created: $REPO_URL_PUBLIC" | tee -a build.log
+        else
+          echo "ERROR: Failed to create repository" | tee -a build.log
+          echo "$CREATE_RESPONSE" | tee -a build.log
+          echo '{"status":"error","error":"Failed to create GitHub repository"}' > output.json
+          exit 1
+        fi
+      fi
+      
+      # Step 3: Copy pre-built Next.js template
+      echo "" | tee -a build.log
+      echo "=== Step 3: Copying pre-built Next.js template ===" | tee -a build.log
+      
+      # Use pre-built template from Docker image to save time and memory
+      if [ -f "/template/package.json" ]; then
+        echo "Using pre-built Next.js latest template..." | tee -a build.log
+        cp -r /template "$PROJECT_NAME"
+        echo "✓ Template copied successfully" | tee -a build.log
+      else
+        echo "WARNING: Pre-built template not found, creating new project..." | tee -a build.log
+        npm config set maxsockets 3
+        npm config set fetch-retries 2
+        npx create-next-app@latest "$PROJECT_NAME" \
+          --typescript --tailwind --eslint --app \
+          --use-npm --no-git --yes 2>&1 | tee -a build.log
+      fi
+      
+      cd "$PROJECT_NAME"
+      
+      # Initialize git in project
+      git init
+      git remote add origin "$REPO_URL"
+      
+      # Step 4: Authenticate with Gemini
+      echo "" | tee -a ../build.log
+      echo "=== Step 4: Authenticating with Gemini ===" | tee -a ../build.log
+      if ! cline auth --provider gemini --apikey "$GEMINI_API_KEY" --modelid "gemini-2.5-flash" 2>&1 | tee -a ../build.log; then
+        echo "Warning: Auth command returned non-zero, continuing..." | tee -a ../build.log
+      fi
+      CLINE_VERSION=$(cline version 2>/dev/null || echo "unknown")
+      echo "Cline version: $CLINE_VERSION" | tee -a ../build.log
+      
+      # Step 5: Run Cline AI with retry
+      echo "" | tee -a ../build.log
+      echo "=== Step 5: Running Cline AI ===" | tee -a ../build.log
+      CLINE_PROMPT="You are in a Next.js App Router project with TypeScript and Tailwind CSS. TASK: COMPLETELY REPLACE app/page.tsx to implement: $USER_PROMPT. RULES: 1. Add 'use client' directive at the top 2. Replace ALL default template code 3. Use Tailwind CSS for styling 4. Make it responsive and beautiful 5. Write VALID JSX syntax - properly close all tags and expressions 6. Test your JSX structure before completing 7. ONLY modify files - DO NOT run npm commands or start dev server 8. When done, use attempt_completion immediately"
+      
+      # Try Cline up to 3 times
+      for attempt in 1 2 3; do
+        echo "Cline attempt $attempt..." | tee -a ../build.log
+        if cline "$CLINE_PROMPT" -y --oneshot 2>&1 | tee -a ../build.log; then
+          echo "Cline completed successfully on attempt $attempt" | tee -a ../build.log
+          break
+        else
+          echo "Cline attempt $attempt failed, retrying..." | tee -a ../build.log
+          sleep 2
+        fi
+      done
+      
+      # Step 6: Capture generated code
+      echo "" | tee -a ../build.log
+      echo "=== Step 6: Capturing generated code ===" | tee -a ../build.log
+      {
+        echo "=== Generated Code ==="
+        echo "Project: $PROJECT_NAME"
+        echo "Timestamp: $(date -Iseconds)"
+        echo ""
+        echo "=== app/page.tsx ==="
+      } > ../code_snapshot.txt
+      
+      if [ -f "app/page.tsx" ]; then
+        cat app/page.tsx >> ../code_snapshot.txt
+        echo "Captured app/page.tsx" | tee -a ../build.log
+      else
+        echo "// No page file found" >> ../code_snapshot.txt
+        echo "Warning: app/page.tsx not found" | tee -a ../build.log
+      fi
+      
+      # Capture layout if exists
+      if [ -f "app/layout.tsx" ]; then
+        echo "" >> ../code_snapshot.txt
+        echo "=== app/layout.tsx ===" >> ../code_snapshot.txt
+        cat app/layout.tsx >> ../code_snapshot.txt
+        echo "Captured app/layout.tsx" | tee -a ../build.log
+      fi
+      
+      # Step 7: Commit and push to GitHub
+      echo "" | tee -a ../build.log
+      echo "=== Step 7: Push to GitHub ===" | tee -a ../build.log
+      
+      git add -A
+      git commit -m "feat: $USER_PROMPT - Generated by Kestra + Cline AI (Execution: ${KESTRA_EXECUTION_ID:-unknown})" 2>&1 | tee -a ../build.log
+      
+      # Push to GitHub with retry
+      PUSH_SUCCESS=false
+      for push_attempt in 1 2 3; do
+        echo "Push attempt $push_attempt..." | tee -a ../build.log
+        if git push -u origin "$BRANCH" 2>&1 | tee -a ../build.log; then
+          PUSH_SUCCESS=true
+          echo "✓ Successfully pushed to GitHub" | tee -a ../build.log
+          break
+        else
+          echo "Push attempt $push_attempt failed, retrying..." | tee -a ../build.log
+          sleep 2
+        fi
+      done
+      
+      if [ "$PUSH_SUCCESS" = false ]; then
+        echo "ERROR: Failed to push to GitHub after 3 attempts" | tee -a ../build.log
+        cd ..
+        echo '{"status":"error","error":"Failed to push to GitHub","repoUrl":"'$REPO_URL_PUBLIC'"}' > output.json
+        exit 1
+      fi
+      
+      COMMIT_SHA=$(git rev-parse HEAD)
+      echo "Commit SHA: $COMMIT_SHA" | tee -a ../build.log
+      
+      # Step 8: Quick Vercel check and prepare links
+      echo "" | tee -a ../build.log
+      echo "=== Step 8: Prepare Vercel Deployment Links ===" | tee -a ../build.log
+      cd ..
+      
+      # Initialize variables
+      VERCEL_CONNECTED=false
+      DEPLOY_URL=""
+      
+      # Quick check for Vercel (1 attempt, 5 seconds max)
+      echo "Quick check for Vercel deployment..." | tee -a build.log
+      sleep 3
+      
+      CHECK_RUNS=$(curl -s --max-time 5 \
+        -H "Authorization: token ${GITHUB_TOKEN}" \
+        -H "Accept: application/vnd.github.v3+json" \
+        "https://api.github.com/repos/${GITHUB_OWNER}/${PROJECT_NAME}/commits/${COMMIT_SHA}/check-runs" 2>/dev/null || echo '{}')
+      
+      # Look for Vercel check
+      VERCEL_CHECK=$(echo "$CHECK_RUNS" | jq -r '.check_runs[]? | select(.name | test("vercel"; "i")) | .details_url' 2>/dev/null | head -1)
+      
+      if [ -n "$VERCEL_CHECK" ] && [ "$VERCEL_CHECK" != "null" ]; then
+        VERCEL_CONNECTED=true
+        echo "✓ Vercel deployment detected!" | tee -a build.log
+        if echo "$VERCEL_CHECK" | grep -q "vercel.app"; then
+          DEPLOY_URL="$VERCEL_CHECK"
+        fi
+      else
+        echo "No active Vercel deployment. Preparing setup links..." | tee -a build.log
+      fi
+      
+      # Detect Vercel GitHub App installation ID (quick check)
+      echo "Detecting Vercel GitHub App..." | tee -a build.log
+      VERCEL_INSTALLATION_ID=$(curl -s --max-time 5 \
+        -H "Authorization: token ${GITHUB_TOKEN}" \
+        -H "Accept: application/vnd.github.v3+json" \
+        "https://api.github.com/user/installations" 2>/dev/null | \
+        jq -r '.installations[]? | select(.app_slug=="vercel") | .id' 2>/dev/null | head -1)
+      
+      if [ -n "$VERCEL_INSTALLATION_ID" ] && [ "$VERCEL_INSTALLATION_ID" != "null" ]; then
+        echo "✓ Found Vercel installation ID: $VERCEL_INSTALLATION_ID" | tee -a build.log
+        GITHUB_APP_SETTINGS_URL="https://github.com/settings/installations/${VERCEL_INSTALLATION_ID}"
+      else
+        echo "Vercel GitHub App not installed" | tee -a build.log
+        GITHUB_APP_SETTINGS_URL="https://github.com/apps/vercel"
+      fi
+      
+      # Step 9: Generate output JSON
+      echo "" | tee -a build.log
+      echo "=== Step 9: Generate Output ===" | tee -a build.log
+      
+      if [ "$VERCEL_CONNECTED" = true ]; then
+        if [ -n "$DEPLOY_URL" ] && [ "$DEPLOY_URL" != "null" ]; then
+          # Vercel connected with deployment URL
+          echo "Status: Deployed to Vercel" | tee -a build.log
+          printf '{\n  "status": "deployed",\n  "vercelConnected": true,\n  "projectName": "%s",\n  "branch": "%s",\n  "commitSha": "%s",\n  "repoUrl": "%s",\n  "previewUrl": "%s",\n  "message": "App deployed to Vercel successfully!",\n  "timestamp": "%s"\n}\n' \
+            "$PROJECT_NAME" "$BRANCH" "$COMMIT_SHA" "$REPO_URL_PUBLIC" "$DEPLOY_URL" "$(date -Iseconds)" > output.json
+          echo "::$(printf '{"outputs":{"repoUrl":"%s","previewUrl":"%s","vercelConnected":"true","status":"deployed"}}' "$REPO_URL_PUBLIC" "$DEPLOY_URL")::"
+        else
+          # Vercel connected but URL not yet available
+          echo "Status: Vercel connected, deployment in progress" | tee -a build.log
+          printf '{\n  "status": "deploying",\n  "vercelConnected": true,\n  "projectName": "%s",\n  "branch": "%s",\n  "commitSha": "%s",\n  "repoUrl": "%s",\n  "githubUrl": "%s/commit/%s",\n  "message": "Code pushed! Vercel deployment in progress.",\n  "timestamp": "%s"\n}\n' \
+            "$PROJECT_NAME" "$BRANCH" "$COMMIT_SHA" "$REPO_URL_PUBLIC" "$REPO_URL_PUBLIC" "$COMMIT_SHA" "$(date -Iseconds)" > output.json
+          echo "::$(printf '{"outputs":{"repoUrl":"%s","vercelConnected":"true","status":"deploying"}}' "$REPO_URL_PUBLIC")::"
+        fi
+      else
+        # Vercel not connected - provide direct links
+        echo "Status: Code pushed, Vercel not connected" | tee -a build.log
+        VERCEL_CONNECT_URL="https://vercel.com/new/import?s=${REPO_URL_PUBLIC}&project-name=${PROJECT_NAME}"
+        VERCEL_DEPLOY_URL="https://vercel.com/new?repo=${REPO_URL_PUBLIC}"
+        
+        printf '{\n  "status": "success",\n  "vercelConnected": false,\n  "projectName": "%s",\n  "branch": "%s",\n  "commitSha": "%s",\n  "repoUrl": "%s",\n  "vercelConnectUrl": "%s",\n  "vercelDeployUrl": "%s",\n  "githubAppSettingsUrl": "%s",\n  "message": "Code ready! Connect to Vercel to deploy.",\n  "timestamp": "%s"\n}\n' \
+          "$PROJECT_NAME" "$BRANCH" "$COMMIT_SHA" "$REPO_URL_PUBLIC" "$VERCEL_CONNECT_URL" "$VERCEL_DEPLOY_URL" "$GITHUB_APP_SETTINGS_URL" "$(date -Iseconds)" > output.json
+        echo "::$(printf '{"outputs":{"repoUrl":"%s","vercelConnectUrl":"%s","vercelDeployUrl":"%s","githubAppSettingsUrl":"%s","vercelConnected":"false","status":"success"}}' "$REPO_URL_PUBLIC" "$VERCEL_CONNECT_URL" "$VERCEL_DEPLOY_URL" "$GITHUB_APP_SETTINGS_URL")::"
+      fi
+      
+      echo "" | tee -a build.log
+      echo "=== Build Complete ===" | tee -a build.log
+      echo "End time: $(date -Iseconds)" | tee -a build.log
+      cat output.json | tee -a build.log
+
+  - id: log-result
+    type: io.kestra.plugin.core.log.Log
+    description: Log the build result
+    message: |
+      Build completed!
+      Repository: {{ outputs['build-and-deploy'].vars.repoUrl }}
+      Vercel Connected: {{ outputs['build-and-deploy'].vars.vercelConnected }}
+      Status: {{ outputs['build-and-deploy'].vars.status }}
+
+outputs:
+  - id: result_json
+    type: FILE
+    description: Complete build result as JSON file
+    value: "{{ outputs['build-and-deploy'].outputFiles['output.json'] }}"
+
+  - id: build_log
+    type: FILE
+    description: Full build log
+    value: "{{ outputs['build-and-deploy'].outputFiles['build.log'] }}"
+
+  - id: code_snapshot
+    type: FILE
+    description: Snapshot of generated code
+    value: "{{ outputs['build-and-deploy'].outputFiles['code_snapshot.txt'] }}"
+
+  - id: repo_url
+    type: STRING
+    description: GitHub repository URL
+    value: "{{ outputs['build-and-deploy'].vars.repoUrl }}"
+
+  - id: vercel_connected
+    type: STRING
+    description: Whether Vercel is connected to this repo
+    value: "{{ outputs['build-and-deploy'].vars.vercelConnected }}"
+
+  - id: status
+    type: STRING
+    description: Build and deployment status
+    value: "{{ outputs['build-and-deploy'].vars.status }}"
+
+  - id: preview_url
+    type: STRING
+    description: Vercel preview URL (if available)
+    value: "{{ outputs['build-and-deploy'].vars.previewUrl ?? '' }}"
+
+  - id: vercel_connect_url
+    type: STRING
+    description: URL to connect repo to Vercel (if not connected)
+    value: "{{ outputs['build-and-deploy'].vars.vercelConnectUrl ?? '' }}"
+
+  - id: vercel_deploy_url
+    type: STRING
+    description: Direct Vercel deployment URL
+    value: "{{ outputs['build-and-deploy'].vars.vercelDeployUrl ?? '' }}"
+
+  - id: github_app_settings_url
+    type: STRING
+    description: GitHub App settings URL to add repo to Vercel
+    value: "{{ outputs['build-and-deploy'].vars.githubAppSettingsUrl ?? '' }}"
+
+triggers:
+  - id: auto-check-for-errors
+    type: io.kestra.plugin.core.trigger.Flow
+    description: Automatically trigger error-fixer flow after this flow completes
+    inputs:
+      repo_owner: "{{ inputs.github_owner }}"
+      repo_name: "{{ vars.project_name }}"
+      max_fix_attempts: 3
+    flowId: vercel-error-fixer
+    namespace: production

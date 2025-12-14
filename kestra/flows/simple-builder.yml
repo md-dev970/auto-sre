@@ -59,9 +59,9 @@ tasks:
       - generated_code.txt
     env:
       USER_PROMPT: "{{ inputs.prompt }}"
-      GEMINI_API_KEY: "AIzaSyArAFsJJb4MMHW8wJKPqtFvC4hsd1UjUlE"
+      GEMINI_API_KEY: ""
       # OPENROUTER_API_KEY: "{{ secret('OPENROUTER_API_KEY') }}"
-      VERCEL_TOKEN: "gtKBQIGzft6pSumfg9qMcHTX"
+      VERCEL_TOKEN: ""
       PROJECT_NAME: "{{ inputs.project_prefix }}-{{ execution.id }}"
       NODE_OPTIONS: "--max-old-space-size=8192"
       HOME: "/root"
@@ -111,7 +111,7 @@ tasks:
       # Step 3: Run Cline AI with retry
       echo "" | tee -a ../build.log
       echo "=== Step 3: Running Cline AI ===" | tee -a ../build.log
-      CLINE_PROMPT="You are in a Next.js 14 App Router project. TASK: COMPLETELY REPLACE app/page.tsx for: $USER_PROMPT. Rules: Add 'use client', replace default code, use Tailwind. ONLY modify files. App deploys automatically."
+      CLINE_PROMPT="You are in a Next.js App Router project. TASK: COMPLETELY REPLACE app/page.tsx for: $USER_PROMPT. Rules: Add 'use client', replace default code, use Tailwind. ONLY modify files. App deploys automatically."
       
       # Try Cline up to 3 times
       for attempt in 1 2 3; do

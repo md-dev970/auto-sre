@@ -52,12 +52,8 @@ RUN cd /usr/local/lib/node_modules/cline && \
 # Create Cline directories with proper structure
 RUN mkdir -p /root/.cline/data /root/.cline/logs
 
-# Install Vercel CLI
-RUN npm install -g vercel
-
 # Verify installations and versions
 RUN echo "=== Cline CLI ===" && cline version && \
-    echo "=== Vercel CLI ===" && vercel --version && \
     echo "=== Node.js ===" && node --version
 
 # Test that SQLite module works correctly (critical verification)
@@ -78,13 +74,14 @@ RUN node -e "\
 # ============================================
 # PRE-BUILD NEXT.JS TEMPLATE (SPEEDS UP BUILDS)
 # ============================================
-# Create template directory
-RUN mkdir -p /template
+# Create template directory and switch to it
+WORKDIR /template
 
 # Create Next.js app template with all dependencies pre-installed
-# Using Next.js 14 for stability (15+ has React Compiler prompt issues)
-WORKDIR /template
-RUN npx --yes create-next-app@14 nextjs-base \
+# Using Next.js latest version
+# Note: create-next-app creates the directory, so we don't use nextjs-base
+# Use echo to automatically answer "No" to React Compiler prompt
+RUN echo "n" | npx --yes create-next-app@latest . \
     --typescript \
     --tailwind \
     --eslint \
@@ -94,7 +91,9 @@ RUN npx --yes create-next-app@14 nextjs-base \
     --use-npm
 
 # Verify template was created correctly
-RUN ls -la /template/nextjs-base && cat /template/nextjs-base/package.json
+RUN ls -la /template && \
+    test -f /template/package.json && \
+    cat /template/package.json
 
 # Clean up npm cache and apt cache to reduce image size
 RUN npm cache clean --force && \

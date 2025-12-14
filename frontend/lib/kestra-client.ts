@@ -45,7 +45,7 @@ export async function triggerFactoryBuilder(prompt: string): Promise<ExecutionRe
   // Directly trigger simple-builder using FormData (multipart/form-data)
   // This matches the curl example in README and avoids 415 Unsupported Media Type errors
   const response = await fetch(
-    `${KESTRA_URL}/executions/trigger/production/simple-builder`,
+    `${KESTRA_URL}/executions/trigger/production/simple-builder-v2`,
     {
       method: 'POST',
       body: formData,
