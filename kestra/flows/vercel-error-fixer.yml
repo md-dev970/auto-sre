@@ -1,0 +1,804 @@
+id: vercel-error-fixer
+namespace: production
+description: |
+  AI-powered Vercel deployment error detector and auto-fixer.
+  
+  This flow:
+  1. Monitors a specific GitHub repo for Vercel deployment status
+  2. Detects build/deployment errors from Vercel
+  3. Uses AI (OpenAI/Gemini) to analyze error logs
+  4. Uses Cline AI to automatically fix the code
+  5. Pushes fixes and triggers new deployment
+  
+  Trigger this flow after simple-builder-v2 completes, or use a schedule to monitor continuously.
+
+labels:
+  env: production
+  team: platform
+  type: ai-error-fixer
+  version: v1
+
+inputs:
+  - id: repo_owner
+    type: STRING
+    description: GitHub repository owner (username) - leave empty to scan all recent repos
+    required: false
+    defaults: ""
+
+  - id: repo_name
+    type: STRING
+    description: GitHub repository name to monitor - leave empty to scan all recent repos
+    required: false
+    defaults: ""
+
+  - id: max_fix_attempts
+    type: INT
+    description: Maximum number of fix attempts
+    required: false
+    defaults: 3
+    
+  - id: scan_all_repos
+    type: BOOLEAN
+    description: Scan all recent repos for errors instead of specific repo
+    required: false
+    defaults: false
+
+tasks:
+  - id: log-start
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      === Vercel Error Fixer Started ===
+      Mode: {{ inputs.repo_owner != '' and inputs.repo_name != '' ? 'Specific Repo' : 'Scan All Repos' }}
+      Repository: {{ inputs.repo_owner != '' ? inputs.repo_owner ~ '/' ~ inputs.repo_name : 'Auto-detect' }}
+      Max fix attempts: {{ inputs.max_fix_attempts }}
+      Execution ID: {{ execution.id }}
+
+  - id: wait-and-poll-vercel-deployment
+    type: io.kestra.plugin.scripts.shell.Script
+    description: Poll Vercel deployment status until it completes (success or failure)
+    warningOnStdErr: false
+    timeout: PT5M
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      image: alpine:latest
+      pullPolicy: IF_NOT_PRESENT
+    beforeCommands:
+      - apk add --no-cache curl jq bash
+    outputFiles:
+      - deployment_status.json
+      - deployment_logs.txt
+    env:
+      GITHUB_TOKEN: ""
+      VERCEL_TOKEN: ""
+      REPO_OWNER: "{{ inputs.repo_owner ?? '' }}"
+      REPO_NAME: "{{ inputs.repo_name ?? '' }}"
+    script: |
+      set -e
+      
+      echo "=== Fetching Vercel Deployment Status ==="
+      
+      # If repo_owner and repo_name are provided, check specific repo
+      if [ -n "$REPO_OWNER" ] && [ -n "$REPO_NAME" ]; then
+        echo "Mode: Checking specific repository"
+        REPO_FULL="${REPO_OWNER}/${REPO_NAME}"
+        echo "Repository: $REPO_FULL"
+        
+        # Get recent deployments and find failed one
+        echo "Checking recent Vercel deployments..."
+        DEPLOYMENTS=$(curl -s --max-time 10 \
+          -H "Authorization: token ${GITHUB_TOKEN}" \
+          "https://api.github.com/repos/${REPO_FULL}/deployments?per_page=10" 2>/dev/null || echo '[]')
+        
+        if [ "$DEPLOYMENTS" = "[]" ] || [ "$DEPLOYMENTS" = "" ]; then
+          echo "WARNING: Could not fetch deployments or no deployments found"
+          # Don't fail - just mark as no errors and continue
+          echo '{"status": "no_errors", "message": "No deployments found"}' > deployment_status.json
+          echo "No deployments found" > deployment_logs.txt
+          echo '::{"outputs":{"status":"no_errors","deployment_id":"none","commit_sha":"none"}}::'
+          exit 0
+        fi
+        
+        # Find first failed deployment
+        LATEST_COMMIT=""
+        DEPLOYMENT_ID=""
+        
+        echo "$DEPLOYMENTS" | jq -c '.[]' | while IFS= read -r deployment; do
+          DEPLOY_ID=$(echo "$deployment" | jq -r '.id')
+          COMMIT_SHA=$(echo "$deployment" | jq -r '.sha')
+          
+          echo "Checking deployment $DEPLOY_ID for commit ${COMMIT_SHA:0:7}..."
+          
+          # Get deployment status
+          STATUS_RESPONSE=$(curl -s --max-time 5 \
+            -H "Authorization: token ${GITHUB_TOKEN}" \
+            "https://api.github.com/repos/${REPO_FULL}/deployments/${DEPLOY_ID}/statuses" 2>/dev/null || echo '[]')
+          
+          DEPLOY_STATE=$(echo "$STATUS_RESPONSE" | jq -r '.[0].state // "unknown"')
+          
+          echo "  State: $DEPLOY_STATE"
+          
+          if [ "$DEPLOY_STATE" = "failure" ] || [ "$DEPLOY_STATE" = "error" ]; then
+            echo "✗ Found failed deployment at commit ${COMMIT_SHA:0:7}"
+            echo "$COMMIT_SHA" > /tmp/failed_commit.txt
+            echo "$DEPLOY_ID" > /tmp/deployment_id.txt
+            break
+          fi
+        done
+        
+        # Read the results from temp files (because of subshell issue with while read)
+        if [ -f /tmp/failed_commit.txt ]; then
+          LATEST_COMMIT=$(cat /tmp/failed_commit.txt)
+          DEPLOYMENT_ID=$(cat /tmp/deployment_id.txt)
+          rm -f /tmp/failed_commit.txt /tmp/deployment_id.txt
+        fi
+        
+        if [ -z "$LATEST_COMMIT" ]; then
+          echo "✓ No failed deployments found"
+          echo '{"status": "no_errors", "message": "No deployment errors detected"}' > deployment_status.json
+          echo "No errors found" > deployment_logs.txt
+          
+          # Export variables before exit - JSON format
+          echo '::{"outputs":{"status":"no_errors","deployment_id":"none","commit_sha":"none"}}::'
+          exit 0
+        fi
+        
+        echo "Will fix deployment $DEPLOYMENT_ID at commit ${LATEST_COMMIT:0:7}"
+        
+      else
+        echo "Mode: Scanning all recent repositories for errors"
+        # Get user's recent repos
+        RECENT_REPOS=$(curl -s --max-time 10 \
+          -H "Authorization: token ${GITHUB_TOKEN}" \
+          "https://api.github.com/user/repos?sort=updated&per_page=10" 2>/dev/null | \
+          jq -r '.[].full_name' | head -10)
+        
+        echo "Scanning repos:"
+        echo "$RECENT_REPOS"
+        
+        # Find first repo with failed Vercel deployment
+        FOUND_ERROR=false
+        for repo in $RECENT_REPOS; do
+          echo "Checking $repo..."
+          
+          # Get recent deployments for this repo
+          DEPLOYMENTS=$(curl -s --max-time 5 \
+            -H "Authorization: token ${GITHUB_TOKEN}" \
+            "https://api.github.com/repos/$repo/deployments?per_page=5" 2>/dev/null || echo '[]')
+          
+          if [ "$DEPLOYMENTS" = "[]" ]; then
+            echo "  No deployments found, skipping..."
+            continue
+          fi
+          
+          # Check each deployment for failures
+          echo "$DEPLOYMENTS" | jq -c '.[]' | while IFS= read -r deployment; do
+            DEPLOY_ID=$(echo "$deployment" | jq -r '.id')
+            COMMIT_SHA=$(echo "$deployment" | jq -r '.sha')
+            
+            # Get deployment status
+            STATUS_RESPONSE=$(curl -s --max-time 5 \
+              -H "Authorization: token ${GITHUB_TOKEN}" \
+              "https://api.github.com/repos/$repo/deployments/${DEPLOY_ID}/statuses" 2>/dev/null || echo '[]')
+            
+            DEPLOY_STATE=$(echo "$STATUS_RESPONSE" | jq -r '.[0].state // "unknown"')
+            
+            if [ "$DEPLOY_STATE" = "failure" ] || [ "$DEPLOY_STATE" = "error" ]; then
+              echo "✗ Found failed deployment in $repo at commit ${COMMIT_SHA:0:7}"
+              echo "$repo" > /tmp/failed_repo.txt
+              echo "$COMMIT_SHA" > /tmp/failed_commit.txt
+              echo "$DEPLOY_ID" > /tmp/deployment_id.txt
+              break
+            fi
+          done
+          
+          # Check if we found a failure
+          if [ -f /tmp/failed_repo.txt ]; then
+            REPO_FULL=$(cat /tmp/failed_repo.txt)
+            LATEST_COMMIT=$(cat /tmp/failed_commit.txt)
+            DEPLOYMENT_ID=$(cat /tmp/deployment_id.txt)
+            rm -f /tmp/failed_repo.txt /tmp/failed_commit.txt /tmp/deployment_id.txt
+            FOUND_ERROR=true
+            break
+          fi
+        done
+        
+        if [ "$FOUND_ERROR" = false ]; then
+          echo "✓ No deployment errors found in recent repos"
+          echo '{"status": "no_errors", "message": "No deployment errors detected"}' > deployment_status.json
+          echo "No errors found" > deployment_logs.txt
+          
+          # Export variables before exit - JSON format
+          echo '::{"outputs":{"status":"no_errors","deployment_id":"none","commit_sha":"none"}}::'
+          exit 0
+        fi
+        
+        echo "Will fix: $REPO_FULL at commit ${LATEST_COMMIT:0:7}"
+      fi
+      
+      echo "Target commit: $LATEST_COMMIT"
+      echo "Deployment ID: $DEPLOYMENT_ID"
+      
+      # Get deployment status details
+      echo "=== Fetching Deployment Status Details ==="
+      STATUS_RESPONSE=$(curl -s --max-time 10 \
+        -H "Authorization: token ${GITHUB_TOKEN}" \
+        "https://api.github.com/repos/${REPO_FULL}/deployments/${DEPLOYMENT_ID}/statuses" 2>/dev/null || echo '[]')
+      
+      STATUS=$(echo "$STATUS_RESPONSE" | jq -r '.[0].state // "unknown"')
+      DEPLOY_URL=$(echo "$STATUS_RESPONSE" | jq -r '.[0].target_url // "none"')
+      ERROR_DESCRIPTION=$(echo "$STATUS_RESPONSE" | jq -r '.[0].description // "none"')
+      LOG_URL=$(echo "$STATUS_RESPONSE" | jq -r '.[0].log_url // "none"')
+      
+      # Debug: Show full status response to find Vercel deployment ID
+      echo "DEBUG: Full GitHub status response (first entry):"
+      echo "$STATUS_RESPONSE" | jq '.[0]'
+      
+      # Export variables IMMEDIATELY for Kestra using JSON format
+      echo "DEBUG: Exporting variables"
+      echo "DEBUG: STATUS=$STATUS"
+      echo "DEBUG: DEPLOYMENT_ID=$DEPLOYMENT_ID"
+      echo "DEBUG: LATEST_COMMIT=$LATEST_COMMIT"
+      
+      # Kestra's standard output format - JSON with double colons (NO SPACES!)
+      echo '::{"outputs":{"status":"'"$STATUS"'","deployment_id":"'"$DEPLOYMENT_ID"'","commit_sha":"'"$LATEST_COMMIT"'"}}::'
+      echo "✓ Variables exported to Kestra outputs"
+      
+      # Disable set -e for the rest of the script to prevent exit on non-critical errors
+      set +e
+      
+      echo "Deployment State: $STATUS"
+      echo "Deploy URL: $DEPLOY_URL"
+      echo "Description: $ERROR_DESCRIPTION"
+      echo "Log URL: $LOG_URL"
+      
+      # Now fetch actual Vercel build logs using Vercel API
+      echo ""
+      echo "=== Fetching Vercel Build Logs via API ==="
+      
+      # Use Vercel API v11 for deployments (latest version)
+      # Key insight: Use projectId parameter for more reliable filtering
+      VERCEL_DEPLOYMENT_ID=""
+      
+      if [ -n "$VERCEL_TOKEN" ]; then
+        echo "Querying Vercel API v11 for deployments..."
+        
+        # First, list all projects to find the one matching our repo
+        # Extract project name from repo (e.g., "app-abubbwyfyxf1ozkjgust2")
+        PROJECTS=$(curl -s --max-time 10 \
+          -H "Authorization: Bearer ${VERCEL_TOKEN}" \
+          "https://api.vercel.com/v9/projects?limit=100" 2>/dev/null || echo '{"projects":[]}')
+        
+        echo "DEBUG: Looking for project matching repo..."
+        # Try to find project by matching GitHub repo in link
+        PROJECT_ID=$(echo "$PROJECTS" | jq -r --arg repo "$REPO_FULL" '
+          .projects[]? | 
+          select(.link.repo? == $repo) | 
+          .id
+        ' | head -1)
+        
+        if [ -z "$PROJECT_ID" ] || [ "$PROJECT_ID" = "null" ]; then
+          echo "⚠ Could not find project by repo link, trying by name..."
+          # Fallback: Try to match by project name (extract from deployment URL)
+          PROJECT_NAME=$(echo "$DEPLOY_URL" | sed 's/https:\/\///' | cut -d'-' -f1-3)
+          echo "DEBUG: Extracted project name from URL: $PROJECT_NAME"
+          
+          PROJECT_ID=$(echo "$PROJECTS" | jq -r --arg name "$PROJECT_NAME" '
+            .projects[]? | 
+            select(.name == $name) | 
+            .id
+          ' | head -1)
+        fi
+        
+        echo "DEBUG: Project ID: $PROJECT_ID"
+        
+        if [ -n "$PROJECT_ID" ] && [ "$PROJECT_ID" != "null" ]; then
+          # Use projectId parameter for reliable filtering (v6 supports projectId, v11 does not!)
+          echo "Fetching deployments for project $PROJECT_ID with commit ${LATEST_COMMIT:0:7}..."
+          VERCEL_DEPLOYMENTS=$(curl -s --max-time 10 \
+            -H "Authorization: Bearer ${VERCEL_TOKEN}" \
+            "https://api.vercel.com/v6/deployments?projectId=${PROJECT_ID}&limit=10" 2>/dev/null || echo '{"deployments":[]}')
+          
+          echo "DEBUG: Project deployments (first 3):"
+          echo "$VERCEL_DEPLOYMENTS" | jq -r '.deployments[0:3] | .[] | {uid, url, state, gitCommit: .meta.githubCommitSha}' 2>/dev/null || echo "No deployments"          # Find deployment matching our commit SHA
+          VERCEL_DEPLOYMENT_ID=$(echo "$VERCEL_DEPLOYMENTS" | jq -r --arg sha "$LATEST_COMMIT" --arg short "${LATEST_COMMIT:0:7}" '
+            .deployments[]? | 
+            select(
+              (.meta.githubCommitSha? == $sha) or 
+              (.meta.githubCommitSha? // "" | startswith($short))
+            ) | 
+            .uid // .id
+          ' | head -1)
+        else
+          echo "⚠ Could not find Vercel project, falling back to sha filter..."
+          # Fallback: Try sha parameter directly (v6 supports both projectId and sha)
+          VERCEL_DEPLOYMENTS=$(curl -s --max-time 10 \
+            -H "Authorization: Bearer ${VERCEL_TOKEN}" \
+            "https://api.vercel.com/v6/deployments?sha=${LATEST_COMMIT}&limit=10" 2>/dev/null || echo '{"deployments":[]}')
+          
+          VERCEL_DEPLOYMENT_ID=$(echo "$VERCEL_DEPLOYMENTS" | jq -r '.deployments[0].uid // .deployments[0].id // empty' | head -1)
+        fi
+        
+        if [ -n "$VERCEL_DEPLOYMENT_ID" ] && [ "$VERCEL_DEPLOYMENT_ID" != "null" ]; then
+          echo "✓ Found Vercel deployment ID: $VERCEL_DEPLOYMENT_ID"
+          echo "Fetching ALL build logs from Vercel API (v3/deployments/{id}/events)..."
+          
+          # Get deployment events (build logs) from Vercel API v3 endpoint
+          # Use builds=1 to include build-specific events
+          # Use limit=-1 to get ALL logs (unlimited, as recommended in Python example)
+          VERCEL_LOGS=$(curl -s --max-time 30 \
+            -H "Authorization: Bearer ${VERCEL_TOKEN}" \
+            "https://api.vercel.com/v3/deployments/${VERCEL_DEPLOYMENT_ID}/events?builds=1&limit=-1" 2>/dev/null || echo '[]')
+          
+          echo "DEBUG: Vercel logs response (first 5 events):"
+          echo "$VERCEL_LOGS" | jq -r '.[0:5] | .[] | {type, text: .text}' 2>/dev/null || echo "Could not parse events"
+          
+          # Extract error messages from events
+          # FIX: Text is directly in .text field, not .payload.text
+          # Look for stderr events and any events with error-related text
+          ERROR_TEXT=$(echo "$VERCEL_LOGS" | jq -r '
+            .[]? | 
+            select(
+              .type == "stderr" or 
+              .type == "command" or 
+              (.text? // "" | test("error|Error|failed|Failed|exception|Exception|Parse|Syntax"; "i"))
+            ) | 
+            .text? // ""
+          ' 2>/dev/null | grep -v '^$' | head -200 || echo "")
+          
+          # If we got logs, clean them up
+          if [ -n "$ERROR_TEXT" ] && [ "$ERROR_TEXT" != '""' ]; then
+            echo "✓ Successfully fetched Vercel build logs ($(echo "$ERROR_TEXT" | wc -l) lines)"
+            # Clean up and format
+            ERROR_TEXT=$(echo "$ERROR_TEXT" | sed 's/\\n/\n/g' | sed 's/\\t/  /g')
+          else
+            echo "⚠ No error logs found in Vercel events, using description"
+            ERROR_TEXT="$ERROR_DESCRIPTION"
+          fi
+        else
+          echo "⚠ Could not find Vercel deployment matching commit ${LATEST_COMMIT:0:7}"
+          echo "DEBUG: This might be a permissions issue or the project might be under a team"
+          ERROR_TEXT="$ERROR_DESCRIPTION"
+        fi
+      else
+        echo "⚠ VERCEL_TOKEN not available"
+        ERROR_TEXT="$ERROR_DESCRIPTION"
+      fi
+      
+      # Save deployment status
+      jq -n \
+        --arg status "$STATUS" \
+        --arg deploy_url "$DEPLOY_URL" \
+        --arg error_desc "$ERROR_DESCRIPTION" \
+        --arg error_text "$ERROR_TEXT" \
+        --arg commit "$LATEST_COMMIT" \
+        --arg deployment_id "$DEPLOYMENT_ID" \
+        '{
+          "status": $status,
+          "deploy_url": $deploy_url,
+          "commit_sha": $commit,
+          "deployment_id": $deployment_id,
+          "has_error": ($status == "failure" or $status == "error"),
+          "error_details": {
+            "description": $error_desc,
+            "text": $error_text
+          },
+          "timestamp": now
+        }' > deployment_status.json
+      
+      # Save error logs if deployment failed
+      if [ "$STATUS" = "failure" ] || [ "$STATUS" = "error" ]; then
+        {
+          echo "=== VERCEL DEPLOYMENT ERROR LOGS ==="
+          echo ""
+          echo "Deployment ID: $DEPLOYMENT_ID"
+          echo "Commit: $LATEST_COMMIT"
+          echo ""
+          echo "Description: $ERROR_DESCRIPTION"
+          echo ""
+          echo "Error Details:"
+          echo "$ERROR_TEXT"
+        } > deployment_logs.txt
+      else
+        echo "Deployment successful - no error logs" > deployment_logs.txt
+      fi
+      
+      echo "Deployment status saved"
+      cat deployment_status.json | jq '.'
+
+  - id: check-if-error
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ (outputs['wait-and-poll-vercel-deployment'].vars.status | default('unknown')) == 'failure' or (outputs['wait-and-poll-vercel-deployment'].vars.status | default('unknown')) == 'error' }}"
+    then:
+      - id: analyze-error-with-ai
+        type: io.kestra.plugin.ai.completion.ChatCompletion
+        provider:
+          type: io.kestra.plugin.ai.provider.GoogleGemini
+          apiKey: ""
+          modelName: "gemini-2.5-flash"
+        messages:
+          - type: SYSTEM
+            content: |
+              You are an expert DevOps engineer analyzing Vercel deployment errors for Next.js applications.
+              Your task is to identify the root cause and provide actionable fixes.
+              
+              Common Next.js/Vercel errors include:
+              - JSX syntax errors (unclosed tags, invalid returns, fragments)
+              - Import/export issues
+              - TypeScript errors
+              - Build configuration problems
+              
+              Return your analysis as valid JSON with this structure:
+              {
+                "root_cause": "Brief description of the root cause",
+                "fix_instructions": "Detailed step-by-step instructions to fix the issue",
+                "files_to_modify": ["list", "of", "files", "that", "need", "changes"]
+              }
+          - type: USER
+            content: |
+              Analyze this Vercel deployment failure and identify the root cause:
+              
+              Deployment Info:
+              - Status: failure
+              - Description: {{ read(outputs['wait-and-poll-vercel-deployment'].outputFiles['deployment_status.json']) | jq('.error_details.description') }}
+              - Commit: {{ read(outputs['wait-and-poll-vercel-deployment'].outputFiles['deployment_status.json']) | jq('.commit_sha') }}
+              
+              Error Logs:
+              {{ read(outputs['wait-and-poll-vercel-deployment'].outputFiles['deployment_logs.txt']) }}
+              
+              Based on the deployment description "Deployment has failed" and the commit that was previously working,
+              analyze what likely went wrong in this Next.js application and provide specific fix instructions.
+              
+              Return ONLY valid JSON with root_cause, fix_instructions, and files_to_modify.
+
+      - id: clone-and-fix-repo
+        type: io.kestra.plugin.scripts.shell.Script
+        description: Clone repo and use Cline AI to fix the error
+        warningOnStdErr: false
+        timeout: PT15M
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          image: kestra-cline:latest
+          pullPolicy: NEVER
+          networkMode: host
+          memory:
+            limit: 6g
+            swap: 1g
+        outputFiles:
+          - fix_log.txt
+          - fix_result.json
+        env:
+          GITHUB_TOKEN: ""
+          GEMINI_API_KEY: ""
+          REPO_OWNER: "{{ inputs.repo_owner }}"
+          REPO_NAME: "{{ inputs.repo_name }}"
+          HOME: "/root"
+          NODE_OPTIONS: "--max-old-space-size=8192"
+          ERROR_LOGS_CONTENT: "{{ read(outputs['wait-and-poll-vercel-deployment'].outputFiles['deployment_logs.txt']) }}"
+          AI_ANALYSIS_CONTENT: "{{ outputs['analyze-error-with-ai'].textOutput }}"
+        script: |
+          # Don't use set -e - we want to export variables even if some commands fail
+          
+          export HOME="${HOME:-/root}"
+          mkdir -p "$HOME/.cline"
+          
+          echo "=== AI-Powered Error Fix ===" | tee -a fix_log.txt
+          
+          # Create context files from environment variables
+          echo "$ERROR_LOGS_CONTENT" > error_logs.txt
+          echo "$AI_ANALYSIS_CONTENT" > ai_analysis.txt
+          
+          echo "Context files created:" | tee -a fix_log.txt
+          echo "  error_logs.txt: $(wc -c < error_logs.txt) bytes" | tee -a fix_log.txt
+          echo "  ai_analysis.txt: $(wc -c < ai_analysis.txt) bytes" | tee -a fix_log.txt
+          echo "" | tee -a fix_log.txt
+          
+          # Clone the repository
+          echo "Cloning repository..." | tee -a fix_log.txt
+          REPO_URL="https://${GITHUB_TOKEN}@github.com/${REPO_OWNER}/${REPO_NAME}.git"
+          git clone "$REPO_URL" repo 2>&1 | tee -a fix_log.txt
+          cd repo
+          
+          echo "" | tee -a ../fix_log.txt
+          echo "Repository cloned successfully" | tee -a ../fix_log.txt
+          echo "Files in repo:" | tee -a ../fix_log.txt
+          ls -la | tee -a ../fix_log.txt
+          
+          # Authenticate with Gemini
+          echo "" | tee -a ../fix_log.txt
+          echo "=== Authenticating with Gemini ===" | tee -a ../fix_log.txt
+          if ! cline auth --provider gemini --apikey "$GEMINI_API_KEY" --modelid "gemini-2.5-flash" 2>&1 | tee -a ../fix_log.txt; then
+            echo "Warning: Auth command returned non-zero, continuing..." | tee -a ../fix_log.txt
+          fi
+          
+          # Read AI analysis and error logs from files (passed via Kestra files section)
+          echo "" | tee -a ../fix_log.txt
+          echo "=== Reading AI Analysis and Error Logs ===" | tee -a ../fix_log.txt
+          
+          # Load context from files created earlier
+          if [ -f ../error_logs.txt ]; then
+            ERROR_LOGS=$(cat ../error_logs.txt)
+            echo "✓ Error logs loaded ($(wc -l < ../error_logs.txt) lines)" | tee -a ../fix_log.txt
+          else
+            ERROR_LOGS="No error logs available"
+            echo "⚠ No error logs file found" | tee -a ../fix_log.txt
+          fi
+          
+          if [ -f ../ai_analysis.txt ]; then
+            AI_ANALYSIS_RAW=$(cat ../ai_analysis.txt)
+            echo "✓ AI analysis loaded ($(wc -c < ../ai_analysis.txt) bytes)" | tee -a ../fix_log.txt
+            echo "AI Analysis preview (first 300 chars):" | tee -a ../fix_log.txt
+            echo "$AI_ANALYSIS_RAW" | head -c 300 | tee -a ../fix_log.txt
+            echo "" | tee -a ../fix_log.txt
+            echo "..." | tee -a ../fix_log.txt
+            
+            # Strip markdown code blocks if present (AI returns ```json...```)
+            echo "Extracting JSON from AI response..." | tee -a ../fix_log.txt
+            AI_ANALYSIS=$(echo "$AI_ANALYSIS_RAW" | sed -n '/```json/,/```/p' | sed '1d;$d' 2>/dev/null || echo "$AI_ANALYSIS_RAW")
+            
+            # If that didn't work, try without the json specifier
+            if [ -z "$AI_ANALYSIS" ] || [ "$AI_ANALYSIS" = "" ]; then
+              AI_ANALYSIS=$(echo "$AI_ANALYSIS_RAW" | sed -n '/```/,/```/p' | sed '1d;$d' 2>/dev/null || echo "$AI_ANALYSIS_RAW")
+            fi
+            
+            # If still empty, use raw
+            if [ -z "$AI_ANALYSIS" ] || [ "$AI_ANALYSIS" = "" ]; then
+              AI_ANALYSIS="$AI_ANALYSIS_RAW"
+            fi
+            
+            echo "Extracted JSON (first 200 chars):" | tee -a ../fix_log.txt
+            echo "$AI_ANALYSIS" | head -c 200 | tee -a ../fix_log.txt
+            echo "..." | tee -a ../fix_log.txt
+          else
+            AI_ANALYSIS='{"root_cause":"Unknown error","fix_instructions":"Unable to get AI analysis","files_to_modify":[]}'
+            echo "⚠ No AI analysis file found, using fallback" | tee -a ../fix_log.txt
+          fi
+          
+          # Prepare AI fix prompt
+          echo "" | tee -a ../fix_log.txt
+          echo "=== Preparing Cline Prompt ===" | tee -a ../fix_log.txt
+          
+          # Extract key info from AI analysis JSON
+          ROOT_CAUSE=$(echo "$AI_ANALYSIS" | jq -r '.root_cause // "Unknown"' 2>/dev/null || echo "Unknown")
+          FIX_INSTRUCTIONS=$(echo "$AI_ANALYSIS" | jq -r '.fix_instructions // "See error logs"' 2>/dev/null || echo "See error logs")
+          FILES_TO_MODIFY=$(echo "$AI_ANALYSIS" | jq -r '.files_to_modify[]? // empty' 2>/dev/null | tr '\n' ' ')
+          
+          echo "Root Cause: $ROOT_CAUSE" | tee -a ../fix_log.txt
+          echo "Files to Modify: ${FILES_TO_MODIFY:-none specified}" | tee -a ../fix_log.txt
+          
+          # Create comprehensive prompt with AI analysis (using printf for YAML compatibility)
+          printf '%s\n' \
+            "You are fixing a Next.js deployment error on Vercel." \
+            "" \
+            "ROOT CAUSE:" \
+            "$ROOT_CAUSE" \
+            "" \
+            "FIX INSTRUCTIONS:" \
+            "$FIX_INSTRUCTIONS" \
+            "" \
+            "FILES TO MODIFY:" \
+            "${FILES_TO_MODIFY:-Check error logs to identify files}" \
+            "" \
+            "ERROR LOGS:" \
+            "$ERROR_LOGS" \
+            "" \
+            "YOUR TASK:" \
+            "Fix the issue by modifying the affected files based on the root cause and fix instructions above." \
+            "" \
+            "RULES:" \
+            "1. Follow the fix instructions precisely" \
+            "2. Focus on the files listed in FILES TO MODIFY" \
+            "3. Ensure all TypeScript/JSX syntax is valid" \
+            "4. DO NOT run npm install, npm build, or any npm commands" \
+            "5. Make minimal changes - only what's needed to fix the error" \
+            "6. After making changes, use attempt_completion to finish" \
+            "" \
+            "Start by examining the error logs and implementing the recommended fixes." \
+            > cline_prompt.txt
+          
+          CLINE_PROMPT=$(cat cline_prompt.txt)
+          
+          echo "" | tee -a ../fix_log.txt
+          echo "=== Running Cline AI to Fix Error ===" | tee -a ../fix_log.txt
+          echo "Full prompt being sent to Cline:" | tee -a ../fix_log.txt
+          echo "---" | tee -a ../fix_log.txt
+          echo "$CLINE_PROMPT" | tee -a ../fix_log.txt
+          echo "---" | tee -a ../fix_log.txt
+          echo "" | tee -a ../fix_log.txt
+          
+          # Run Cline AI to fix
+          if cline "$CLINE_PROMPT" -y --oneshot 2>&1 | tee -a ../fix_log.txt; then
+            echo "✓ Cline fix completed successfully" | tee -a ../fix_log.txt
+            CLINE_EXIT_CODE=0
+          else
+            CLINE_EXIT_CODE=$?
+            echo "✗ Cline fix failed with exit code: $CLINE_EXIT_CODE" | tee -a ../fix_log.txt
+          fi
+          
+          # Check if files were modified
+          if git diff --quiet; then
+            echo "WARNING: No files were modified by Cline" | tee -a ../fix_log.txt
+            HAS_CHANGES=false
+            FIX_STATUS="no_changes"
+          else
+            echo "✓ Files modified by Cline:" | tee -a ../fix_log.txt
+            git diff --name-only | tee -a ../fix_log.txt
+            echo "" | tee -a ../fix_log.txt
+            echo "Changes:" | tee -a ../fix_log.txt
+            git diff | tee -a ../fix_log.txt
+            HAS_CHANGES=true
+            FIX_STATUS="success"
+          fi
+          
+          # Commit and push fixes to new branch ONLY if changes were made
+          if [ "$HAS_CHANGES" = "true" ]; then
+            echo "" | tee -a ../fix_log.txt
+            echo "=== Creating Fix Branch and Committing ===" | tee -a ../fix_log.txt
+            
+            # Extract root cause from AI analysis for commit message
+            ROOT_CAUSE=$(echo "$AI_ANALYSIS" | jq -r '.root_cause // "Vercel deployment error"' 2>/dev/null || echo "Vercel deployment error")
+            
+            # Create sanitized branch name from root cause
+            BRANCH_SUFFIX=$(echo "$ROOT_CAUSE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | cut -c1-30)
+            TIMESTAMP=$(date +%s)
+            BRANCH_NAME="fix-error-${TIMESTAMP}-${BRANCH_SUFFIX}"
+            
+            echo "Creating branch: $BRANCH_NAME" | tee -a ../fix_log.txt
+            git checkout -b "$BRANCH_NAME" 2>&1 | tee -a ../fix_log.txt
+            
+            git config user.name "Kestra AI Fixer"
+            git config user.email "ai-fixer@kestra.io"
+            git add -A
+            
+            # Create commit message  
+            printf "🤖 AI Fix: %s\n\nAutomated fix by Kestra AI\n\nRoot Cause: %s\n\nThis fix was automatically generated and pushed to a separate branch for review.\nPlease review the changes before merging to main.\n\nExecution ID: {{ execution.id }}" "$ROOT_CAUSE" "$ROOT_CAUSE" > commit_msg.txt
+            
+            git commit -F commit_msg.txt 2>&1 | tee -a ../fix_log.txt
+            
+            # Push branch with retry
+            for attempt in 1 2 3; do
+              echo "Push attempt $attempt to branch $BRANCH_NAME..." | tee -a ../fix_log.txt
+              if git push -u origin "$BRANCH_NAME" 2>&1 | tee -a ../fix_log.txt; then
+                echo "✓ Changes pushed successfully to branch: $BRANCH_NAME" | tee -a ../fix_log.txt
+                PUSH_STATUS="success"
+                FIX_BRANCH="$BRANCH_NAME"
+                
+                # Create PR URL for user to review
+                PR_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/compare/main...${BRANCH_NAME}?expand=1"
+                echo "" | tee -a ../fix_log.txt
+                echo "📋 Review changes and create PR:" | tee -a ../fix_log.txt
+                echo "$PR_URL" | tee -a ../fix_log.txt
+                break
+              else
+                echo "Push attempt $attempt failed" | tee -a ../fix_log.txt
+                PUSH_STATUS="failed"
+                FIX_BRANCH=""
+                sleep 2
+              fi
+            done
+          else
+            echo "" | tee -a ../fix_log.txt
+            echo "⚠️ Skipping branch creation - no changes made" | tee -a ../fix_log.txt
+            PUSH_STATUS="skipped_no_changes"
+            FIX_BRANCH=""
+            PR_URL="none"
+          fi
+          
+          # Generate fix result
+          COMMIT_SHA=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+          FIX_BRANCH="${FIX_BRANCH:-none}"
+          PR_URL="${PR_URL:-none}"
+          
+          cd ..
+          jq -n \
+            --arg fix_status "$FIX_STATUS" \
+            --arg push_status "$PUSH_STATUS" \
+            --arg commit_sha "$COMMIT_SHA" \
+            --arg branch "$FIX_BRANCH" \
+            --arg pr_url "$PR_URL" \
+            '{
+              "fix_status": $fix_status,
+              "push_status": $push_status,
+              "commit_sha": $commit_sha,
+              "fix_branch": $branch,
+              "pr_url": $pr_url,
+              "timestamp": now
+            }' > fix_result.json
+          
+          echo "" | tee -a fix_log.txt
+          echo "=== Fix Complete ===" | tee -a fix_log.txt
+          cat fix_result.json | tee -a fix_log.txt
+          
+          # Debug: Show what we're exporting
+          echo "" | tee -a fix_log.txt
+          echo "DEBUG: Exporting to Kestra:" | tee -a fix_log.txt
+          echo "  FIX_BRANCH=${FIX_BRANCH:-none}" | tee -a fix_log.txt
+          echo "  PR_URL=${PR_URL:-none}" | tee -a fix_log.txt
+          echo "  FIX_STATUS=${FIX_STATUS:-unknown}" | tee -a fix_log.txt
+          
+          # Export variables for Kestra
+          echo '::{"outputs":{"fix_branch":"'"${FIX_BRANCH:-none}"'","pr_url":"'"${PR_URL:-none}"'","fix_status":"'"${FIX_STATUS:-unknown}"'"}}::'
+
+      - id: log-fix-summary
+        type: io.kestra.plugin.core.log.Log
+        description: Log fix summary and next steps
+        message: |
+          🎉 AI Fix Complete!
+          
+          Fix Status: {{ outputs['clone-and-fix-repo'].vars.fix_status | default('unknown') }}
+          Branch created: {{ outputs['clone-and-fix-repo'].vars.fix_branch | default('none') }}
+          PR URL: {{ outputs['clone-and-fix-repo'].vars.pr_url | default('none') }}
+          
+          {% if outputs['clone-and-fix-repo'].vars.fix_branch != 'none' and outputs['clone-and-fix-repo'].vars.fix_branch != '' %}
+          ✅ SUCCESS! The fix has been pushed to a separate branch.
+          
+          Next Steps:
+          1. Review the changes at: {{ outputs['clone-and-fix-repo'].vars.pr_url }}
+          2. Test the changes if needed
+          3. Merge the PR to deploy the fix
+          4. Vercel will automatically deploy once merged
+          
+          The fix will NOT be deployed until you manually merge the PR.
+          {% else %}
+          ⚠️ WARNING: Branch creation may have failed. Check the fix_log.txt for details.
+          
+          Possible issues:
+          - Cline didn't make any changes (no files modified)
+          - Git push failed (authentication issue?)
+          - Cline execution failed
+          
+          Review the clone-and-fix-repo task logs for more details.
+          {% endif %}
+
+    else:
+      - id: no-error-detected
+        type: io.kestra.plugin.core.log.Log
+        message: |
+          ✅ No deployment errors detected!
+          Status: {{ outputs['wait-and-poll-vercel-deployment'].vars.status | default('success') }}
+
+  - id: log-result
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      === Error Fixer Complete ===
+      Repository: {{ inputs.repo_owner }}/{{ inputs.repo_name }}
+      Initial deployment status: {{ outputs['wait-and-poll-vercel-deployment'].vars.status | default('unknown') }}
+      {% if outputs['clone-and-fix-repo'].vars.pr_url is defined and outputs['clone-and-fix-repo'].vars.pr_url != 'none' %}
+      
+      🔍 Review AI-generated fix:
+      Branch: {{ outputs['clone-and-fix-repo'].vars.fix_branch }}
+      Create PR: {{ outputs['clone-and-fix-repo'].vars.pr_url }}
+      {% endif %}
+
+outputs:
+  - id: deployment_status
+    type: FILE
+    description: Vercel deployment status
+    value: "{{ outputs['wait-and-poll-vercel-deployment'].outputFiles['deployment_status.json'] }}"
+
+  - id: had_error
+    type: STRING
+    description: Whether deployment had an error
+    value: "{{ (outputs['wait-and-poll-vercel-deployment'].vars.status | default('unknown')) == 'failure' or (outputs['wait-and-poll-vercel-deployment'].vars.status | default('unknown')) == 'error' }}"
+
+triggers:
+  - id: github-push-event
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Trigger when GitHub pushes code (via webhook)
+    key: "github-webhook-{{ flow.id }}"
+    conditions:
+      - type: io.kestra.plugin.core.condition.ExpressionCondition
+        expression: "{{ trigger.body.ref == 'refs/heads/main' }}"
+    inputs:
+      repo_owner: "{{ trigger.body.repository.owner.login ?? trigger.body.repository.owner.name }}"
+      repo_name: "{{ trigger.body.repository.name }}"
+      max_fix_attempts: 3
+
+  - id: continuous-monitoring-fallback
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Fallback - monitor repos every 15 minutes (in case webhook fails)
+    cron: "*/15 * * * *"
+    inputs:
+      repo_owner: ""
+      repo_name: ""
+      scan_all_repos: true
+      max_fix_attempts: 3

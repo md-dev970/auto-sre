@@ -1,0 +1,22 @@
+# Environment files with secrets
+.env
+
+# Kestra data directory
+kestra-data/
+
+# Output files
+output/
+
+# Docker build artifacts
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+
+node_modules/
